@@ -76,6 +76,11 @@ except Exception:
 # ── Models ───────────────────────────────────
 class TextRequest(BaseModel):
     text: str
+    session_id: str = "default"
+
+
+class SessionCreateRequest(BaseModel):
+    name: str | None = None
 
 
 class TextResponse(BaseModel):
@@ -160,14 +165,14 @@ async def ask_text(req: TextRequest, tts: str = "server"):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
     loop = asyncio.get_event_loop()
-    reply = await loop.run_in_executor(None, process, req.text)
+    reply = await loop.run_in_executor(None, process, req.text, req.session_id)
     if tts == "server":
         speak(reply)
     return TextResponse(reply=reply)
 
 
 @app.post("/ask-voice", response_model=TextResponse)
-async def ask_voice(audio: UploadFile = File(...)):
+async def ask_voice(audio: UploadFile = File(...), session_id: str = "default"):
     """
     Accepts audio upload, transcribes with whisper.cpp,
     processes through Jarvis brain, speaks reply.
@@ -225,7 +230,7 @@ async def ask_voice(audio: UploadFile = File(...)):
 
     # Process through Jarvis brain
     loop = asyncio.get_event_loop()
-    reply = await loop.run_in_executor(None, process, text.strip())
+    reply = await loop.run_in_executor(None, process, text.strip(), session_id)
 
     return TextResponse(reply=reply, transcription=text.strip())
 
@@ -257,7 +262,7 @@ PARTIAL_INTERVAL = 2.0  # seconds between partial transcriptions
 
 
 @app.websocket("/ws")
-async def websocket_stream(ws: WebSocket):
+async def websocket_stream(ws: WebSocket, session_id: str = "default"):
     """WebSocket endpoint for streaming voice: audio chunks → partial transcription → reply + TTS audio."""
     await ws.accept()
 
@@ -301,7 +306,7 @@ async def websocket_stream(ws: WebSocket):
 
         # Process through brain
         loop = asyncio.get_event_loop()
-        reply = await loop.run_in_executor(None, process, full_text)
+        reply = await loop.run_in_executor(None, process, full_text, session_id)
 
         await ws.send_json({"type": "final", "transcription": full_text, "reply": reply})
 
@@ -487,13 +492,64 @@ async def stop():
 
 
 @app.post("/brain/reset")
-async def brain_reset():
-    from brain import clear_pending_safe, conversation, conversation_context
+async def brain_reset(session_id: str = "default"):
+    from brain import reset_conversation
 
-    clear_pending_safe()
-    conversation.clear()
-    conversation_context.__init__()
-    return {"status": "reset"}
+    reset_conversation(session_id)
+    return {"status": "reset", "session_id": session_id}
+
+
+# ── Sessions (persistent conversation threads, shared phone + computer) ──
+@app.get("/sessions")
+async def sessions_list():
+    from session_store import list_sessions
+
+    return {"sessions": list_sessions()}
+
+
+@app.post("/sessions")
+async def sessions_create(req: SessionCreateRequest | None = None):
+    from session_store import create_session
+
+    name = req.name if req else None
+    return {"session": create_session(name)}
+
+
+@app.get("/sessions/{session_id}/history")
+async def sessions_history(session_id: str):
+    from session_store import get_session, load_messages
+
+    meta = get_session(session_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    return {"session": meta, "messages": load_messages(session_id)}
+
+
+@app.post("/sessions/{session_id}/rename")
+async def sessions_rename(session_id: str, req: TextRequest):
+    from session_store import rename_session
+
+    meta = rename_session(session_id, req.text)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    return {"session": meta}
+
+
+@app.post("/sessions/{session_id}/reset")
+async def sessions_reset(session_id: str):
+    from brain import reset_conversation
+
+    reset_conversation(session_id)
+    return {"status": "reset", "session_id": session_id}
+
+
+@app.delete("/sessions/{session_id}")
+async def sessions_delete(session_id: str):
+    from session_store import delete_session
+
+    if not delete_session(session_id):
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    return {"status": "deleted", "session_id": session_id}
 
 
 @app.get("/weather")

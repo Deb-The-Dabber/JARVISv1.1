@@ -41,6 +41,12 @@ os.environ.setdefault(
     "JARVIS_GEMINI_USAGE_FILE",
     os.path.join(tempfile.gettempdir(), "jarvis_test_gemini_usage.json"),
 )
+# Persistent conversation sessions: keep every test (including fixture-spawned
+# servers, which inherit this env) out of the real ~/.jarvis/sessions store.
+os.environ.setdefault(
+    "JARVIS_SESSIONS_DIR",
+    os.path.join(tempfile.gettempdir(), "jarvis_test_sessions"),
+)
 _TEST_ISOLATION_NS = f"{os.getpid()}_{int(time.time())}"
 
 
@@ -122,7 +128,9 @@ def jarvis_server():
 def api(jarvis_server):
     base = jarvis_server
     session = requests.Session()
-    session.post(f"{base}/brain/reset", timeout=10)
+    # reset can wait behind a slow in-flight /ask (process lock held for the
+    # whole turn); give it a generous client timeout instead of 10s.
+    session.post(f"{base}/brain/reset", timeout=90)
 
     class API:
         def ask(self, text: str, timeout=180):

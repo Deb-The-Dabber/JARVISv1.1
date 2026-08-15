@@ -422,7 +422,7 @@ class RequestScheduler:
             try:
                 print(f"\n  You → {task.text}  {tag}")
                 print("  Jarvis thinking...")
-                reply = process(task.text)
+                reply = process(task.text, _session_id)
                 usage = get_provider_status_summary()
                 if usage:
                     print(f"  [{usage}]")
@@ -442,6 +442,8 @@ _FG_WORKERS = int(os.environ.get("JARVIS_FG_WORKERS", "1"))
 _BG_WORKERS = int(os.environ.get("JARVIS_BG_WORKERS", "1"))
 
 _scheduler: Optional[RequestScheduler] = None
+
+_session_id = os.environ.get("JARVIS_SESSION", "default")
 
 
 # ─────────────────────────────────────────────
@@ -468,7 +470,7 @@ def handle_input_legacy(text: str):
         try:
             print(f"\n  You → {t}")
             print("  Jarvis thinking...")
-            reply = process(t)
+            reply = process(t, _session_id)
             usage = get_provider_status_summary()
             if usage:
                 print(f"  [{usage}]")
@@ -522,7 +524,7 @@ def _sanitize_input(text: str) -> str | None:
 
 
 def main():
-    global _current_mode, _paste_buffer, _queue_buffer
+    global _current_mode, _paste_buffer, _queue_buffer, _session_id
     terminal_init()
     print("\nModes:")
 
@@ -540,6 +542,7 @@ def main():
 
         wakeword.start(on_wake_word)
         print("\n  Jarvis is listening. Say 'Hey Jarvis' to activate.")
+        print(f"  Session: {_session_id}  (type 'session' to manage sessions)")
         print("  Press Ctrl+C to quit.\n")
         try:
             while True:
@@ -554,7 +557,7 @@ def main():
 
     else:
         print("\nPress Enter to speak, type a message, or 'quit' to exit.")
-        print("Type 'wake' to switch to wake word mode mid-session.\n")
+        print(f"Type 'wake' to switch to wake word mode mid-session. Session: {_session_id}\n")
 
         while True:
             try:
@@ -1027,8 +1030,83 @@ def main():
                 print(f"  Pruning memories older than {days} days...")
                 prune_old_memories(days=days)
 
+            elif user_input.lower().strip() in ("session", "sessions", "session list"):
+                _print_sessions()
+
+            elif user_input.lower().startswith("session new"):
+                from session_store import create_session
+
+                name = user_input[11:].strip()
+                meta = create_session(name or None)
+                _session_id = meta["id"]
+                print(f"  Switched to new session '{meta['name']}' ({meta['id']}).")
+
+            elif user_input.lower().startswith("session switch") or user_input.lower().startswith("session use"):
+                from session_store import list_sessions
+
+                target = user_input.split(None, 2)[-1].strip().lower()
+                found = None
+                for s in list_sessions():
+                    if target in (s["id"].lower(), s["name"].lower()):
+                        found = s
+                        break
+                if found:
+                    _session_id = found["id"]
+                    print(f"  Switched to session '{found['name']}' ({found['id']}).")
+                else:
+                    print(f"  No session matches '{target}'. Use 'session list' to see sessions.")
+
+            elif user_input.lower().startswith("session rename"):
+                from session_store import rename_session
+
+                parts = user_input.split(None, 3)
+                if len(parts) < 4:
+                    print("  Usage: session rename <id> <new name>")
+                else:
+                    meta = rename_session(parts[2], parts[3])
+                    if not meta:
+                        print(f"  Session '{parts[2]}' not found.")
+                    else:
+                        print(f"  Renamed to '{meta['name']}'.")
+
+            elif user_input.lower().startswith("session delete"):
+                from session_store import delete_session
+
+                target = user_input.split(None, 2)[-1].strip()
+                if not target:
+                    print("  Usage: session delete <id>")
+                elif target == _session_id:
+                    print("  Can't delete the active session. Switch first (session switch <id>).")
+                elif delete_session(target):
+                    print(f"  Deleted session '{target}'.")
+                else:
+                    print(f"  Session '{target}' not found.")
+
+            elif user_input.lower().startswith("session reset"):
+                from brain import reset_conversation
+
+                reset_conversation(_session_id)
+                print(f"  Reset session '{_session_id}' — history cleared.")
+
             else:
                 handle_input(user_input)
+
+
+def _print_sessions():
+    from session_store import ensure_default_session, list_sessions
+
+    ensure_default_session()
+    sessions = list_sessions()
+    print(f"  Active session: {_session_id}  (sessions: {len(sessions)})")
+    for s in sessions:
+        marker = "→ " if s["id"] == _session_id else "  "
+        preview = f" — \"{s['preview'][:60]}\"" if s["preview"] else ""
+        print(
+            f"  {marker}{s['id']:<20} {s['name']:<20} "
+            f"{s['message_count']:>4} msgs{preview}"
+        )
+    print("  Commands: session new <name> | session switch <id> | "
+          "session rename <id> <name> | session reset | session delete <id>")
 
 
 if __name__ == "__main__":

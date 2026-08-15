@@ -1,11 +1,13 @@
 import { useState } from 'react';
 import { useStore } from '../stores/useAppStore';
+import { useSessionStore } from '../stores/useSessionStore';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export function InputRow() {
   const [text, setText] = useState('');
   const { setOrbState, addActivity } = useStore();
+  const activeId = useSessionStore((s) => s.activeId);
 
   const setReply = (reply: string) => {
     const el = document.getElementById('reply');
@@ -39,7 +41,7 @@ export function InputRow() {
       const res = await fetch(`${API}/ask${ttsOnPhone ? '?tts=client' : ''}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: trimmed }),
+        body: JSON.stringify({ text: trimmed, session_id: activeId }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();

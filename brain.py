@@ -499,6 +499,7 @@ def _summarize_conversation(recent_turns: int = 10) -> str:
 
 
 conversation = []
+_process_lock = threading.RLock()
 pending_action = {"fn": None, "description": None, "expires_at": 0}
 _learned_tools = {}
 _loading_learned_tools = False
@@ -597,7 +598,47 @@ conversation_context = ConversationContext()
 
 
 def get_conversation_context() -> dict:
-    return conversation_context.snapshot()
+    with _process_lock:
+        return conversation_context.snapshot()
+
+
+def _load_session_history(session_id: str) -> None:
+    """Reload the persistent session's messages into the in-memory buffer."""
+    from session_store import ensure_default_session, load_messages
+
+    ensure_default_session()
+    conversation.clear()
+    conversation.extend(load_messages(session_id))
+
+
+def _session_append(session_id: str, role: str, content: str) -> None:
+    """Append a turn to the in-memory buffer and the persistent store."""
+    from session_store import append_message
+
+    conversation.append({"role": role, "content": content})
+    append_message(session_id, role, content)
+
+
+def reset_conversation(session_id: str = "default", timeout: float = 60.0) -> None:
+    """Clear pending confirmations, in-memory context, and persisted history.
+
+    Waits up to `timeout` seconds for the process lock (a request may be
+    mid-turn); on timeout the persisted history is cleared anyway so a hung
+    provider can't wedge reset, and the in-memory buffer is left for the
+    in-flight turn to finish.
+    """
+    from session_store import clear_session
+
+    clear_pending_safe()
+    acquired = _process_lock.acquire(timeout=timeout)
+    try:
+        if acquired:
+            conversation.clear()
+            conversation_context.__init__()
+    finally:
+        if acquired:
+            _process_lock.release()
+    clear_session(session_id)
 
 
 def _check_fragment(text: str, ctx: ConversationContext) -> str | None:
@@ -3875,6 +3916,11 @@ def _handle_cad_request(user_message: str) -> str:
 
 
 def ask_with_tools(user_message: str) -> str:
+    with _process_lock:
+        return _ask_with_tools_impl(user_message)
+
+
+def _ask_with_tools_impl(user_message: str) -> str:
     global _last_provider_used, _last_model_used, _nemotron_usage_count
 
     ask_start = time.time()
@@ -4591,7 +4637,20 @@ def _sanitize_user_message(text: str) -> str:
     return cleaned
 
 
-def process(text):
+def process(text, session_id="default"):
+    """Route a user turn through the brain, scoped to a persistent session.
+
+    Holds the process lock for the whole turn so concurrent requests
+    (terminal scheduler threads, server executor threads) never share
+    the in-memory conversation unsafely. Session history is loaded from
+    the persistent store under the lock and appended back on completion.
+    """
+    with _process_lock:
+        _load_session_history(session_id)
+        return _process_impl(text, session_id)
+
+
+def _process_impl(text, session_id):
     global _turn_memo_cache, _current_request_id
     _turn_memo_cache = {}
     _tool_call_names.clear()
@@ -4946,8 +5005,8 @@ def process(text):
         )
         reply = ask_with_tools(text)
 
-    conversation.append({"role": "user", "content": text})
-    conversation.append({"role": "assistant", "content": reply})
+    _session_append(session_id, "user", text)
+    _session_append(session_id, "assistant", reply)
 
     # Periodic LLM conversation summarization (every 20 turns) to keep context compact
     try:

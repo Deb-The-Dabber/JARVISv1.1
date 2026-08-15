@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../stores/useAppStore';
 import { useAuthStore } from '../stores/useAuthStore';
+import { useSessionStore } from '../stores/useSessionStore';
 
 export interface WebSocketMessage {
   type: string;
@@ -14,12 +15,15 @@ export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const { connected, setConnected, fallbackMode, setFallbackMode, addActivity } = useAppStore();
   const { accessToken } = useAuthStore();
+  const activeId = useSessionStore((s) => s.activeId);
   const [wsReady, setWsReady] = useState(false);
   const reconnectTimeoutRef = useRef<number | null>(null);
-  const wsUrl = `${import.meta.env.VITE_WS_URL || 'ws://localhost:8000'}/ws`;
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
+    const sessionId = useSessionStore.getState().activeId || 'default';
+    const wsUrl = `${import.meta.env.VITE_WS_URL || 'ws://localhost:8000'}/ws?session_id=${encodeURIComponent(sessionId)}`;
     
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -95,7 +99,7 @@ export function useWebSocket() {
         wsRef.current = null;
       }
     };
-  }, [connect]);
+  }, [connect, activeId]);
 
   const sendAudio = useCallback((audioBlob: Blob) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {

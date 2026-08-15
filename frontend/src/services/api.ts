@@ -7,6 +7,8 @@ import type {
   AutomationStartRequest,
   AutomationResponse,
   ApiResponse,
+  SessionMeta,
+  SessionMessage,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -76,12 +78,49 @@ export async function getMemories(): Promise<any> {
 }
 
 // Chat
-export async function askText(text: string, tts = 'server'): Promise<any> {
+export async function askText(text: string, tts = 'server', sessionId = 'default'): Promise<any> {
   const res = await fetchJson<any>('/ask', {
     method: 'POST',
-    body: JSON.stringify({ text, tts }),
+    body: JSON.stringify({ text, tts, session_id: sessionId }),
   });
   return res.data;
+}
+
+// Sessions (persistent conversation threads, shared across devices)
+export async function getSessions(): Promise<SessionMeta[]> {
+  const res = await fetchJson<any>('/sessions');
+  return (res.data?.sessions ?? []) as SessionMeta[];
+}
+
+export async function createSession(name?: string): Promise<SessionMeta> {
+  const res = await fetchJson<any>('/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ name: name ?? null }),
+  });
+  return res.data?.session as SessionMeta;
+}
+
+export async function getSessionHistory(
+  id: string
+): Promise<{ session: SessionMeta; messages: SessionMessage[] }> {
+  const res = await fetchJson<any>(`/sessions/${encodeURIComponent(id)}/history`);
+  return res.data as { session: SessionMeta; messages: SessionMessage[] };
+}
+
+export async function renameSession(id: string, name: string): Promise<SessionMeta> {
+  const res = await fetchJson<any>(`/sessions/${encodeURIComponent(id)}/rename`, {
+    method: 'POST',
+    body: JSON.stringify({ text: name }),
+  });
+  return res.data?.session as SessionMeta;
+}
+
+export async function resetSession(id: string): Promise<void> {
+  await fetchJson(`/sessions/${encodeURIComponent(id)}/reset`, { method: 'POST' });
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  await fetchJson(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 // Remote control

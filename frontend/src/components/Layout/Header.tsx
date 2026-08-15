@@ -1,7 +1,63 @@
 import { useState, useEffect } from 'react';
 import { useStore } from '../../stores/useAppStore';
+import { useSessionStore } from '../../stores/useSessionStore';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+function SessionSwitcher() {
+  const { sessions, activeId, fetchSessions, setActive, createSession } = useSessionStore();
+
+  useEffect(() => {
+    fetchSessions();
+  }, [fetchSessions]);
+
+  const handleNew = async () => {
+    const name = window.prompt('New session name (optional):');
+    if (name === null) return;
+    await createSession(name || undefined);
+  };
+
+  return (
+    <div className="session-switcher" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+      <select
+        value={activeId}
+        onChange={(e) => setActive(e.target.value)}
+        title="Switch session"
+        style={{
+          background: 'var(--bg-elev)',
+          color: 'var(--fg)',
+          border: '1px solid var(--border)',
+          borderRadius: '4px',
+          padding: '2px 6px',
+          fontSize: '0.7rem',
+          maxWidth: '160px',
+        }}
+      >
+        {sessions.length === 0 && <option value={activeId}>default</option>}
+        {sessions.map((s) => (
+          <option key={s.id} value={s.id}>
+            {s.name} ({s.message_count})
+          </option>
+        ))}
+      </select>
+      <button
+        onClick={handleNew}
+        title="New session"
+        style={{
+          background: 'var(--bg-elev)',
+          color: 'var(--fg)',
+          border: '1px solid var(--border)',
+          borderRadius: '4px',
+          padding: '2px 8px',
+          fontSize: '0.7rem',
+          cursor: 'pointer',
+        }}
+      >
+        + New
+      </button>
+    </div>
+  );
+}
 
 export function Header() {
   const { connected } = useStore();
@@ -62,6 +118,9 @@ export function Header() {
         <div className="status-item">
           <div className={isOnline ? "dot" : "dot offline"} id="modelDot"></div>
           <span id="modelStatus">{model}</span>
+        </div>
+        <div className="status-item">
+          <SessionSwitcher />
         </div>
         <div className="status-item" id="timeDisplay">{time}</div>
       </div>

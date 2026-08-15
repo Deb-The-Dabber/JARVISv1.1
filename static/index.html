@@ -478,6 +478,12 @@
         <div class="dot" id="modelDot"></div>
         <span id="modelStatus">MODEL</span>
       </div>
+      <div class="status-item">
+        <select id="sessionSelect" title="Switch session" onchange="switchSession(this.value)"
+          style="background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; font-size: 0.7rem; max-width: 160px;"></select>
+        <button onclick="newSession()" title="New session"
+          style="background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-size: 0.7rem; margin-left: 6px;">+ New</button>
+      </div>
       <div class="status-item" id="timeDisplay">--:-- --</div>
     </div>
   </header>
@@ -1040,7 +1046,7 @@
 
       // Connect WebSocket
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${protocol}//${location.host}/ws`);
+      ws = new WebSocket(`${protocol}//${location.host}/ws?session_id=${encodeURIComponent(getActiveSession())}`);
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
@@ -1199,6 +1205,64 @@
     }
   }
 
+  // ── SESSIONS (persistent threads, shared with computer) ──
+  let _activeSession = localStorage.getItem("jarvis-session") || "default";
+
+  function getActiveSession() { return _activeSession; }
+
+  async function loadSessions() {
+    try {
+      const res = await fetch("/sessions");
+      if (!res.ok) return;
+      const { sessions } = await res.json();
+      const sel = document.getElementById("sessionSelect");
+      sel.innerHTML = "";
+      for (const s of sessions) {
+        const opt = document.createElement("option");
+        opt.value = s.id;
+        opt.textContent = `${s.name} (${s.message_count})`;
+        sel.appendChild(opt);
+      }
+      if (!sessions.some(s => s.id === _activeSession)) {
+        _activeSession = sessions.length ? sessions[0].id : "default";
+        localStorage.setItem("jarvis-session", _activeSession);
+      }
+      sel.value = _activeSession;
+    } catch (e) { /* server not up yet */ }
+  }
+
+  async function switchSession(id) {
+    _activeSession = id;
+    localStorage.setItem("jarvis-session", id);
+    try {
+      const res = await fetch(`/sessions/${encodeURIComponent(id)}/history`);
+      if (!res.ok) return;
+      const { messages } = await res.json();
+      const lines = messages.map(m =>
+        `${m.role === "user" ? "You" : "Jarvis"}: ${m.content}`).join("\n\n");
+      setReply(lines || "No messages yet in this session.");
+    } catch (e) { }
+  }
+
+  async function newSession() {
+    const name = window.prompt("New session name (optional):");
+    if (name === null) return;
+    try {
+      const res = await fetch("/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name || null })
+      });
+      const { session } = await res.json();
+      await loadSessions();
+      await switchSession(session.id);
+    } catch (e) {
+      addActivity("Couldn't create session", "error");
+    }
+  }
+
+  loadSessions();
+
   // ── TEXT SEND ──
   async function sendText() {
     const input = document.getElementById("textInput");
@@ -1228,7 +1292,7 @@
       const res = await fetch(`/ask${ttsOnPhone ? '?tts=client' : ''}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, session_id: getActiveSession() })
       });
       const data = await res.json();
       if (ttsOnPhone && data.reply) {

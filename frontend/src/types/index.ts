@@ -84,6 +84,21 @@ export interface ChatMessage {
   timestamp: string;
 }
 
+export interface SessionMeta {
+  id: string;
+  name: string;
+  created: string;
+  updated: string;
+  message_count: number;
+  preview: string;
+}
+
+export interface SessionMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  ts?: string;
+}
+
 export interface WebSocketMessage {
   type: 'audio' | 'end_audio' | 'text' | 'ping' | 'pong' | 'partial' | 'transcribed' | 'final' | 'tool_call' | 'tool_result' | 'reply' | 'tts_start' | 'tts_chunk' | 'tts_done' | 'error';
   data?: any;
