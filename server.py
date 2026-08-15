@@ -114,16 +114,31 @@ async def health_providers():
     return get_provider_health()
 
 
-@app.get("/health/providers")
-async def health_providers():
-    from brain import get_provider_health
+def _debug_http_enabled() -> bool:
+    """/debug/* endpoints are off unless JARVIS_DEBUG_HTTP=1.
 
-    return get_provider_health()
+    The server binds 0.0.0.0 and may be exposed publicly (Tailscale Funnel);
+    decision traces can contain commands/paths, so the surface is
+    default-closed. JARVIS_DEBUG_TOKEN (if set) additionally requires
+    `Authorization: Bearer <token>`.
+    """
+    return os.getenv("JARVIS_DEBUG_HTTP", "0").lower() in ("1", "true", "yes", "on")
+
+
+async def _debug_gate(request: Request) -> None:
+    if not _debug_http_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    token = os.getenv("JARVIS_DEBUG_TOKEN", "")
+    if token:
+        provided = (request.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+        if not provided or provided != token:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.get("/debug/decisions")
-async def debug_decisions(request_id: str = None, limit: int = 100):
+async def debug_decisions(request: Request, request_id: str = None, limit: int = 100):
     """Return decision traces for a request or recent requests."""
+    await _debug_gate(request)
     from decision_log import load_recent_decisions
 
     events = load_recent_decisions(limit=limit, request_id=request_id)
@@ -131,8 +146,9 @@ async def debug_decisions(request_id: str = None, limit: int = 100):
 
 
 @app.get("/debug/decisions/{request_id}")
-async def debug_decision_trace(request_id: str):
+async def debug_decision_trace(request: Request, request_id: str):
     """Full trace for a single request, ordered by timestamp."""
+    await _debug_gate(request)
     from decision_log import get_decision_trace
 
     trace = get_decision_trace(request_id)

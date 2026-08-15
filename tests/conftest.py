@@ -53,12 +53,16 @@ def _free_port(port: int = 8002):
     """
     try:
         result = subprocess.run(
-            ["lsof", "-nP", "-iTCP", f":{port}", "-sTCP:LISTEN"],
+            ["lsof", "-nP", f"-tiTCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
+        # `-tiTCP:{port}` must be a single argv token (lsof otherwise treats
+        # `:8002` as a filename and errors out with empty output); `-t` prints
+        # PIDs only (no header row). The isdigit() guard is defense-in-depth
+        # against any stray non-numeric output line.
+        pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip().isdigit()]
         for pid in pids:
             os.kill(int(pid), signal.SIGKILL)
             print(f"  Killed stale process {pid} on port {port}")
