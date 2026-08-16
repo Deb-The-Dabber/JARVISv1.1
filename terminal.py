@@ -531,7 +531,10 @@ def _sanitize_input(text: str) -> str | None:
 def main():
     global _current_mode, _paste_buffer, _queue_buffer, _session_id
 
-    if os.environ.get("JARVIS_TUI", "0") == "1":
+    _tui_flag = os.environ.get("JARVIS_TUI")
+    if _tui_flag is None:
+        _tui_flag = "1" if (sys.stdin.isatty() and sys.stdout.isatty()) else "0"
+    if _tui_flag == "1":
         from tui import run_tui
 
         run_tui(_session_id)

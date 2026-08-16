@@ -7,7 +7,7 @@ Layout:
     right: Activity rail (tool calls, subagent progress, safety, latency)
 
 Env:
-    JARVIS_TUI=1                 enable (terminal.py dispatches here)
+    JARVIS_TUI=0                 force classic REPL (TUI is the default when stdin/stdout are TTYs)
     JARVIS_TUI_ANNOUNCE=1        speak panel-init flavor lines
     JARVIS_TUI_VISION=1          auto-start the camera when VISION opens
 """

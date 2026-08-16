@@ -61,7 +61,7 @@ Constants in `config.py` (user info, paths, TTLs, models).
 
 | File | Role |
 |------|------|
-| `terminal.py` | CLI: voice/text → brain → TTS, wake word loop, proactive engine |
+| `terminal.py` | CLI: voice/text → brain → TTS, wake word loop, proactive engine. Textual "control console" TUI by default on real terminals (ctrl+l/t/m/p/v/w/g panes, ctrl+r record, ctrl+q quit); `JARVIS_TUI=0` forces the classic REPL, `JARVIS_TUI_VISION=0` skips camera autostart, `JARVIS_TUI_ANNOUNCE=1` speaks flavor lines |
 | `server.py` | FastAPI :8002: `/ask`, `/ask-voice`, `/health`, `/system`, `/weather`, `/recap`, `/memories`, `/priorities`, `/audit`, `/brain/reset`, `/oauth/*`, `/learner/*`, `/inspect` |
 | `brain.py` | Provider chain, tool calling, safety gating, tool definitions, intent router, circuit breaker, `_tool_call_names` tracking, `get_last_tool_calls()` |
 | `routing_policy.py` | Optional policy-driven provider selection (Phase 2A): capability/latency/cost/health scoring, hard gates, classifier-output parsing. Wired via `JARVIS_ROUTER_POLICY` / `JARVIS_ROUTER_CHEAP` |
