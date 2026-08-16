@@ -2592,6 +2592,13 @@ def _execute_tool(fn_name: str, fn_args: dict) -> str:
         result = fn(**safe_args)
         log_audit(fn_name, safe_args, TOOL_PERMISSIONS.get(fn_name, "WARNING"), "EXECUTED")
         result_str = str(result)
+        try:
+            from event_bus import publish
+
+            _args_preview = ", ".join(f"{k}={str(v)[:80]}" for k, v in (safe_args or {}).items())
+            publish("tool_call", {"tool": fn_name, "args": _args_preview[:200]})
+        except Exception:
+            pass
         log_decision(
             phase="act",
             decision="tool_execute_complete",

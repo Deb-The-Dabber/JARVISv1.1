@@ -15,6 +15,7 @@ def read_file(path: str, offset: int = 0) -> str:
     try:
         p = _expand(path)
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        offset = int(offset)
         start = offset
         end = offset + 200
         shown = lines[start:end]

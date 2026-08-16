@@ -18,6 +18,7 @@ Toggles:
 """
 import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,81 @@ SELF_MOD_AUDIT_PATH = os.path.join(os.path.expanduser("~"), ".jarvis", "self_mod
 WRITE_TOOLS = {"create_file", "write_file", "append_file"}
 EXEC_TOOLS = {"run_terminal_command", "run_python", "run_python_sandboxed", "run_command_sandboxed"}
 SELF_MOD_TOOL = "modify_own_tool"
+
+# ─────────────────────────────────────────────
+# REPO-FILE DESTRUCTION GUARD
+# ─────────────────────────────────────────────
+# The sandbox preview for terminal/python commands is a REAL run (OS sandbox,
+# but the real filesystem is visible). A command like `rm brain.py` therefore
+# executes during the preview itself — before the user ever approves. Any
+# destructive operation targeting the Jarvis repo or protected core files is
+# rejected BEFORE a preview runs.
+_DESTRUCTIVE_BINS = ("rm", "rmdir", "unlink", "shred", "truncate", "mv")
+_DESTRUCTIVE_PAT = re.compile(
+    r"(^|[\s;|&()])(" + "|".join(_DESTRUCTIVE_BINS) + r")(\s|$)",
+    re.IGNORECASE,
+)
+_PY_DESTRUCTIVE_PAT = re.compile(
+    r"(os\.(remove|unlink|rmdir)\s*\(|shutil\.rmtree\s*\(|\.unlink\s*\(|os\.truncate\s*\()",
+    re.IGNORECASE,
+)
+
+
+def _protected_paths() -> list[str]:
+    seen = {os.path.abspath(JARVIS_ROOT)}
+    for rel in PROTECTED_CORE_FILES:
+        seen.add(os.path.normpath(os.path.join(JARVIS_ROOT, rel)))
+    extra = os.environ.get("JARVIS_PROTECTED_FILES", "")
+    for p in extra.split(","):
+        p = p.strip()
+        if p and os.path.isabs(p):
+            seen.add(os.path.normpath(p))
+    return sorted(seen)
+
+
+def _targets_repo(path_str: str, protected: list[str]) -> bool:
+    raw = path_str.strip().strip("\"'")
+    if not raw or raw.startswith("-") or any(c in raw for c in "*?["):
+        return False
+    p = os.path.expanduser(raw)
+    if not os.path.isabs(p):
+        p = os.path.abspath(os.path.join(JARVIS_ROOT, p))
+    p = os.path.normpath(p)
+    if os.path.basename(p) in {os.path.basename(b) for b in PROTECTED_CORE_FILES}:
+        return True
+    for base in protected:
+        try:
+            if p == base or os.path.commonpath([p, base]) == base:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def destructive_preview_block(cmd: str, is_python: bool = False) -> str | None:
+    """Return a block reason if `cmd` destructively targets the repo/protected
+    files. None means safe to preview."""
+    protected = _protected_paths()
+    if is_python:
+        if not _PY_DESTRUCTIVE_PAT.search(cmd):
+            return None
+        for m in re.finditer(r"([\"'])(.*?)\1", cmd):
+            if _targets_repo(m.group(2), protected):
+                return f"Destructive Python call targets a protected file: {m.group(2)}"
+        return None
+    for segment in re.split(r"[;|&]", cmd):
+        if not _DESTRUCTIVE_PAT.search(segment):
+            continue
+        tokens = segment.split()
+        op = tokens[0].lower()
+        if op == "mv":
+            args = [t for t in tokens[1:]]
+        else:
+            args = [t for t in tokens[1:] if not t.startswith("-")]
+        for arg in args:
+            if _targets_repo(arg, protected):
+                return f"{op} targets a protected file: {arg}"
+    return None
 
 # Core files that get the special self-modification review.
 PROTECTED_CORE_FILES = {
@@ -224,6 +300,9 @@ def run_exec_preview(fn_name: str, args: dict) -> str:
     if fn_name in ("run_terminal_command", "run_command_sandboxed"):
         from safety import analyze_command
 
+        _block = destructive_preview_block(args.get("command", ""))
+        if _block:
+            return f"[BLOCKED] Command not previewed: {_block}"
         allowed, _level, reason = analyze_command(args.get("command", ""))
         if not allowed:
             return f"[BLOCKED] Command not previewed: {reason}"
@@ -233,6 +312,9 @@ def run_exec_preview(fn_name: str, args: dict) -> str:
             allow_network=bool(args.get("allow_network", False)),
         )
     else:
+        _block = destructive_preview_block(args.get("code", ""), is_python=True)
+        if _block:
+            return f"[BLOCKED] Python not previewed: {_block}"
         result = preview_python(args.get("code", ""), timeout=int(args.get("timeout", 30) or 30))
     return format_exec_preview(fn_name, args, result)
 

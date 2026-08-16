@@ -131,6 +131,38 @@ def test_exec_preview_terminal():
     assert "hello" in out
 
 
+def test_destructive_preview_block_repo_file():
+    assert "BLOCKED" in ax.run_exec_preview("run_terminal_command", {"command": "rm brain.py"})
+    assert "BLOCKED" in ax.run_exec_preview("run_terminal_command", {"command": "rm --force server.py"})
+    assert "BLOCKED" in ax.run_exec_preview("run_terminal_command", {"command": "cd tools && rm -f code_tools.py"})
+    assert "BLOCKED" in ax.run_exec_preview(
+        "run_terminal_command", {"command": "ls /tmp; mv brain.py /tmp/deleted.py"}
+    )
+    assert "BLOCKED" in ax.run_exec_preview(
+        "run_terminal_command", {"command": f"unlink {ax.JARVIS_ROOT}/safety.py"}
+    )
+
+
+def test_destructive_preview_block_outside_scope():
+    assert "rm" not in ax.run_exec_preview(
+        "run_terminal_command", {"command": "rm /tmp/jarvis_probe_test_ojo7.txt"}
+    ).split("Command: ")[0]
+    assert "4" in ax.run_exec_preview("run_python", {"code": "print(2+2)"})
+
+
+def test_destructive_python_block_repo_file():
+    assert "BLOCKED" in ax.run_exec_preview(
+        "run_python", {"code": "import os; os.remove('brain.py')"}
+    )
+    assert "BLOCKED" in ax.run_exec_preview(
+        "run_python", {"code": "import shutil; shutil.rmtree('tools')"}
+    )
+    assert "BLOCKED" in ax.run_exec_preview(
+        "run_python", {"code": f"from pathlib import Path; Path('{ax.JARVIS_ROOT}/server.py').unlink()"}
+    )
+    assert "4" in ax.run_exec_preview("run_python", {"code": "print(2+2); import os; os.remove('/tmp/nope_j7.txt')"})
+
+
 def test_intent_previews():
     assert "Navigate to: https://x" in ax.format_intent_preview("browser_navigate", {"url": "https://x"})
     assert "iMessage to bob" in ax.format_intent_preview("send_imessage", {"contact": "bob", "message": "hi"})

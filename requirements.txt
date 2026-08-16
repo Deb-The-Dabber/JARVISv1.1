@@ -62,6 +62,7 @@ pyobjc-framework-Quartz==12.1
 pyperclip==1.11.0
 PyRect==0.2.0
 PyScreeze==1.0.1
+textual==8.2.8
 PySocks @ file:///home/conda/feedstock_root/build_artifacts/pysocks_1733217236728/work
 pytweening==1.2.0
 requests @ file:///home/conda/feedstock_root/build_artifacts/requests_1755614211359/work

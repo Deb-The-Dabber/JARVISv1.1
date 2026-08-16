@@ -445,6 +445,11 @@ _scheduler: Optional[RequestScheduler] = None
 
 _session_id = os.environ.get("JARVIS_SESSION", "default")
 
+# Multi-problem auto-splitting is opt-in: it fired on regular multi-line
+# code tasks and fragmented them into separate prompts. Pastes never split
+# unless this is explicitly enabled (and the content has no code fences).
+JARVIS_MULTI_PROBLEM = os.environ.get("JARVIS_MULTI_PROBLEM", "0") == "1"
+
 
 # ─────────────────────────────────────────────
 # HANDLE INPUT
@@ -525,6 +530,13 @@ def _sanitize_input(text: str) -> str | None:
 
 def main():
     global _current_mode, _paste_buffer, _queue_buffer, _session_id
+
+    if os.environ.get("JARVIS_TUI", "0") == "1":
+        from tui import run_tui
+
+        run_tui(_session_id)
+        sys.exit(0)
+
     terminal_init()
     print("\nModes:")
 
@@ -571,7 +583,8 @@ def main():
                         user_input = _sanitize_input(raw_input)
                         if user_input is None:
                             continue
-                    elif raw_line.strip() == "":
+                    elif raw_line.strip() == "/" or raw_line.strip().lower() in ("/go", "go"):
+                        # Paste terminator: submit accumulated buffer whole.
                         if _paste_buffer:
                             full_text = "\n".join(_paste_buffer)
                             _paste_buffer = []
@@ -579,18 +592,22 @@ def main():
                             if len(full_text) > 2000:
                                 print(f"  Summarizing paste ({len(full_text)} chars)...")
                                 full_text = _summarize_paste(full_text)
-                            raw_input = full_text
-                            user_input = _sanitize_input(raw_input)
+                            user_input = _sanitize_input(full_text)
                             if user_input is None:
                                 continue
-                            # Check for multi-problem content
-                            problems = extract_problems(raw_input)
-                            if len(problems) >= 2:
-                                strategy, selected = prompt_problem_strategy(len(problems))
-                                handle_multi_problem(problems, strategy, selected)
-                                continue
+                            if JARVIS_MULTI_PROBLEM and "```" not in full_text:
+                                problems = extract_problems(full_text)
+                                if len(problems) >= 2:
+                                    strategy, selected = prompt_problem_strategy(len(problems))
+                                    handle_multi_problem(problems, strategy, selected)
+                                    continue
                         else:
+                            print("  (Nothing pasted yet.)")
                             continue
+                    elif raw_line.strip().lower() in ("/cancel", "/discard", "cancel", "discard"):
+                        _paste_buffer = []
+                        print("  Paste discarded.")
+                        continue
                     else:
                         _paste_buffer.append(raw_line.rstrip())
                         continue
@@ -648,448 +665,581 @@ def main():
                 else:
                     print("  Didn't catch that.\n")
 
-            elif user_input.lower() in ("quit", "exit", "q"):
-                speak("Goodbye.")
-                wait_for_speech()
-                sys.exit(0)
-
-            elif user_input.lower() == "wake":
-                import wakeword
-
-                wakeword.start(on_wake_word)
-                print("  Wake word active — say 'Hey Jarvis' anytime.\n")
-
-            elif user_input.lower() in ("plugins", "plugins list"):
-                from plugin_manager import print_plugin_status
-
-                print_plugin_status()
-
-            elif user_input.lower() == "plugins reload":
-                from plugin_manager import reload_plugins
-
-                print("  Reloading plugins...")
-                results = reload_plugins()
-                loaded = sum(1 for r in results if r.get("ok"))
-                print(f"  Loaded {loaded}/{len(results)} plugins.")
-
-            elif user_input.lower().startswith("plugin install "):
-                source = user_input[len("plugin install ") :].strip()
-                from plugin_manager import install_plugin
-
-                result = install_plugin(source)
-                if result.get("ok"):
-                    print(f"  Installed plugin: {result['name']}")
-                else:
-                    print(f"  Failed: {result.get('error', 'unknown')}")
-
-            elif user_input.lower() in ("workflows", "wf list"):
-                from workflow_engine import list_workflows
-
-                for w in list_workflows():
-                    tag = "builtin" if w.get("builtin") else "user"
-                    print(f"  [{tag}] {w['name']}: {w['description']}")
-
-            elif user_input.lower().startswith("workflow run ") or user_input.lower().startswith("wf run "):
-                parts = user_input.split(maxsplit=2)
-                wf_name = parts[2] if len(parts) > 2 else ""
-                from workflow_engine import run_workflow
-
-                print(f"  Running workflow '{wf_name}'...")
-                result = run_workflow(wf_name)
-                if result.get("ok"):
-                    print(f"  Done. Result: {result['result'][:300]}")
-                else:
-                    print(f"  Failed: {result.get('error', 'unknown')}")
-
-            elif user_input.lower() in ("wf history", "workflow history"):
-                from workflow_engine import get_run_history
-
-                for h in get_run_history(10):
-                    print(f"  #{h['id']} {h['workflow']} — {h['status']} ({h.get('started', '?')[:19]})")
-
-            elif user_input.lower().startswith("ingest "):
-                path = user_input[7:].strip()
-                from rag_memory import index_folder
-
-                print(f"  Indexing {path}...")
-                files, chunks = index_folder(path)
-                print(f"  Indexed {files} files, {chunks} chunks")
-
-            elif user_input.lower().startswith("rag search "):
-                query = user_input[11:].strip()
-                from rag_memory import search_rag_structured
-
-                result = search_rag_structured(query)
-                if result.get("results"):
-                    for r in result["results"]:
-                        print(f"  [{r['source']}] (score={r['score']}): {r['text'][:200]}")
-                else:
-                    print("  No results found.")
-
-            elif user_input.lower() in ("rag prune", "rag clean"):
-                from rag_memory import prune_stale_entries
-
-                deleted = prune_stale_entries(90)
-                print(f"  Pruned {deleted} stale chunks older than 90 days.")
-
-            elif user_input.lower() == "rag stats":
-                from rag_memory import get_rag_stats
-
-                stats = get_rag_stats()
-                print(f"  Files: {stats.get('total_files', 0)}")
-                print(f"  Chunks: {stats.get('total_chunks', 0)}")
-                print(f"  BM25 ready: {stats.get('bm25_ready', '?')}")
-
-            elif user_input.lower() in ("triggers", "trigger list"):
-                from trigger_engine import list_triggers
-
-                for t in list_triggers():
-                    status = "✓" if t["enabled"] else "✗"
-                    print(f"  [{t['id']}] {status} {t['name']} ({t['trigger_type']}/{t['action_type']}) — {t.get('description', '')}")
-                    if t.get("next_fire"):
-                        print(f"       next: {t['next_fire']}, count: {t['fire_count']}")
-
-            elif user_input.lower().startswith("trigger add "):
-                from trigger_engine import create_trigger
-
-                parts = user_input.split(None, 5)
-                if len(parts) < 5:
-                    print("  Usage: trigger add <name> <type> <schedule> <action_type> <action_target> [description]")
-                    print("  Types: cron, interval, once, event")
-                    print("  Action types: workflow, tool, prompt")
-                    print("  Examples:")
-                    print("    trigger add cleanup interval 6h tool organize_downloads")
-                    print("    trigger add briefing cron '0 8 * * *' prompt 'give me a morning briefing'")
-                    print("    trigger add weather_once once 2026-06-22T09:00:00 tool get_weather")
-                else:
-                    try:
-                        name = parts[2]
-                        t = parts[3]
-                        sched = parts[4]
-                        a_type = parts[5].split()[0] if len(parts) > 5 else ""
-                        rest = user_input.split(None, 6)
-                        a_target = rest[6].split(" ", 1)[0] if len(rest) > 6 else ""
-                        desc = rest[6].split(" ", 1)[1] if len(rest) > 6 and " " in rest[6] else ""
-                        t = create_trigger(name, t, sched, a_type, a_target, {}, desc)
-                        print(f"  Created trigger [{t['id']}] {t['name']}")
-                    except (IndexError, ValueError) as e:
-                        print(f"  Error: {e}")
-
-            elif user_input.lower().startswith("trigger remove ") or user_input.lower().startswith("trigger delete "):
-                from trigger_engine import delete_trigger
-
-                try:
-                    tid = int(user_input.split()[-1])
-                    if delete_trigger(tid):
-                        print(f"  Deleted trigger [{tid}]")
-                    else:
-                        print(f"  Trigger [{tid}] not found")
-                except (IndexError, ValueError):
-                    print("  Usage: trigger remove <id>")
-
-            elif user_input.lower().startswith("trigger pause "):
-                from trigger_engine import disable_trigger
-
-                try:
-                    tid = int(user_input.split()[-1])
-                    trig = disable_trigger(tid)
-                    print(f"  Paused trigger [{tid}] {trig.get('name', '')}")
-                except (IndexError, ValueError):
-                    print("  Usage: trigger pause <id>")
-
-            elif user_input.lower().startswith("trigger resume "):
-                from trigger_engine import enable_trigger
-
-                try:
-                    tid = int(user_input.split()[-1])
-                    trig = enable_trigger(tid)
-                    print(f"  Resumed trigger [{tid}] {trig.get('name', '')}")
-                except (IndexError, ValueError):
-                    print("  Usage: trigger resume <id>")
-
-            elif user_input.lower() == "trigger history" or user_input.lower() == "trigger log":
-                from trigger_engine import get_trigger, get_trigger_history
-
-                for h in get_trigger_history(limit=20):
-                    trig = get_trigger(h["trigger_id"]) or {}
-                    trig_name = trig.get("name", f"id={h['trigger_id']}")
-                    status_icon = "✓" if h["status"] == "done" else "✗"
-                    print(f"  [{h['id']}] {status_icon} {trig_name} @ {h['triggered_at']} ({h['duration_ms']}ms)")
-                    if h.get("error"):
-                        print(f"       error: {h['error']}")
-
-            elif user_input.lower().startswith("vision analyze "):
-                from tools.vision_tools import analyze_image
-
-                path = user_input[15:].strip()
-                result = analyze_image(path=path)
-                print(f"  {result[:300]}")
-
-            elif user_input.lower().startswith("vision ocr "):
-                from tools.vision_tools import ocr_document
-
-                path = user_input[11:].strip()
-                result = ocr_document(path)
-                print(f"  {result[:300]}")
-
-            elif user_input.lower().startswith("vision video "):
-                from tools.vision_tools import analyze_video
-
-                parts = user_input[13:].strip().split()
-                path = parts[0] if parts else ""
-                ts = parts[1] if len(parts) > 1 else "0"
-                result = analyze_video(path, timestamps=ts)
-                print(f"  {result[:300]}")
-
-            elif user_input.lower() in ("agent list", "agents"):
-                from agent import list_agents
-
-                agents = list_agents()
-                if not agents:
-                    print("  No agents running.")
-                else:
-                    for a in agents:
-                        ok = a.get("successful_steps", 0)
-                        print(f"  [{a['id']}] {a['status']} — {a['goal'][:60]} ({a['step_count']} steps, {ok} ok)")
-
-            elif user_input.lower().startswith("agent stop "):
-                from agent import stop_agent
-
-                aid = user_input.split(None, 2)[-1]
-                if stop_agent(aid):
-                    print(f"  Stopped agent {aid}")
-                else:
-                    print(f"  Agent {aid} not found")
-
-            elif user_input.lower() in ("graph stats", "graph summary"):
-                from graph_memory import get_graph_summary
-
-                print(f"  {get_graph_summary()}")
-
-            elif user_input.lower().startswith("graph extract "):
-                from graph_memory import extract_entities_relations
-
-                text = user_input.split(None, 2)[-1]
-                results = extract_entities_relations(text)
-                print(f"  Extracted {len(results)} relationship(s)")
-                for r in results:
-                    print(f"    {r['entity1']} --[{r['relationship']}]--> {r['entity2']}")
-
-            elif user_input.lower().startswith("graph neighbors "):
-                from graph_memory import query_relationships, search_neighbors
-
-                entity = user_input.split(None, 2)[-1]
-                print(f"  {query_relationships(entity)}")
-                neighbors = search_neighbors(entity)
-                if neighbors:
-                    print(f"  Neighbors: {', '.join(n['entity'] for n in neighbors)}")
-
-            elif user_input.lower().startswith("graph search "):
-                from graph_memory import hybrid_graph_search
-
-                query = user_input.split(None, 2)[-1]
-                results = hybrid_graph_search(query)
-                if results:
-                    for r in results:
-                        neighs = ", ".join(r.get("neighbors", []))
-                        print(f"  [{r['entity']}] ({r['entity_type']}) score={r['score']} — neighbors: {neighs}")
-                else:
-                    print("  No graph matches.")
-
-            elif user_input.lower() in ("mic", "switch mic"):
-                input_devices = list_input_devices()
-                if input_devices:
-                    try:
-                        choice = input("  Select mic index: ").strip()
-                        if choice.isdigit() and int(choice) in input_devices:
-                            _INPUT_DEVICE_INDEX = int(choice)
-                            mic = sd.query_devices(_INPUT_DEVICE_INDEX)
-                            print(f"  Mic switched to [{_INPUT_DEVICE_INDEX}] {mic.get('name', 'Unknown')}")
-                        else:
-                            print("  Invalid index.")
-                    except (EOFError, KeyboardInterrupt):
-                        print("  Mic selection cancelled.")
-
-            elif user_input.lower() in ("/context", "context"):
-                try:
-                    from brain import get_conversation_context
-
-                    ctx = get_conversation_context()
-                    print(f"  State: {ctx['state']}")
-                    print(f"  Problem: {ctx['last_problem'][:80] if ctx.get('last_problem') else 'none'}")
-                    print(f"  Solution: {ctx['last_solution'][:80] if ctx.get('last_solution') else 'none'}")
-                    print(f"  Intent: {ctx.get('last_intent', '?')}")
-                    print(f"  Provider: {ctx.get('last_provider', '?')}")
-                    print(f"  Tools: {', '.join(ctx.get('last_tools', [])) or 'none'}")
-                    print(f"  Fragment awaiting: {ctx.get('fragment_awaiting_context', False)}")
-                except Exception as e:
-                    print(f"  Context error: {e}")
-
-            elif user_input.lower() in ("/provider-status", "/ps", "/providers"):
-                try:
-                    status = get_runtime_status()
-                    now = datetime.datetime.now().timestamp()
-                    print("\n=== Provider Status ===")
-                    print(f"{'Provider':<25} {'Status':<20} {'Health':<8} {'Failures':<8}")
-                    print("-" * 65)
-                    all_providers = set(_provider_health_scores.keys())
-                    for p in status.get("providers", {}):
-                        all_providers.add(p)
-                    for provider in sorted(all_providers):
-                        if provider == "huggingface":
-                            continue
-                        backoff = _provider_backoff_until.get(provider, 0)
-                        health = _provider_health_scores.get(provider, 100)
-                        failures = _provider_consecutive_failures.get(provider, 0)
-                        if backoff > now:
-                            remaining = int(backoff - now)
-                            status_str = f"BACKED OFF ({remaining}s)"
-                        else:
-                            status_str = "OK"
-                        print(f"  {provider:<25} {status_str:<20} {health:<8} {failures:<8}")
-                    print()
-                except Exception as e:
-                    print(f"  Provider status error: {e}")
-
-            elif user_input.lower().startswith("/mode") or user_input.lower().startswith("/m "):
-                parts = user_input.split()
-                mode_name = parts[-1].lower() if len(parts) > 1 else ""
-                mode_map = {"text": InputMode.TEXT, "t": InputMode.TEXT, "paste": InputMode.PASTE, "p": InputMode.PASTE, "queue": InputMode.QUEUE, "q": InputMode.QUEUE}
-                if mode_name in mode_map:
-                    _current_mode = mode_map[mode_name]
-                    _paste_buffer = []
-                    print(f"  Mode switched to {_current_mode.upper()}")
-                else:
-                    print("  Modes: /mode text|paste|queue  (or /m t|p|q)")
-                    print(f"  Current: {_current_mode.upper()}")
-
-            elif user_input.lower() in ("/queue show", "/q show", "queue show"):
-                if _queue_buffer:
-                    print(f"  Queue ({len(_queue_buffer)} items):")
-                    for i, item in enumerate(_queue_buffer, 1):
-                        print(f"    {i}. {item[:120]}")
-                else:
-                    print("  Queue is empty.")
-
-            elif user_input.lower() in ("/queue clear", "/q clear", "queue clear"):
-                _queue_buffer.clear()
-                print("  Queue cleared.")
-
-            elif user_input.lower() in ("test", "test run", "test logs", "test status", "test report",
-                                        "test findings", "test history", "test stop", "self-test", "selftest") \
-                    or user_input.lower().startswith(("test confirm ", "test dismiss ", "self-test ", "selftest ")):
-                from self_test.agent import handle_command
-
-                print("  " + handle_command(user_input).replace("\n", "\n  "))
-
-            elif user_input.lower() in ("backup", "backup now", "backups", "backup list"):
-                import backup
-
-                if user_input.lower() in ("backup", "backup now"):
-                    print("  Backing up state...")
-                    result = backup.run_backup()
-                    print(f"  Backup: {result['backup_dir']}")
-                    print(f"  Copied: {', '.join(result['copied']) or 'none'}")
-                    if result["skipped"]:
-                        print(f"  Skipped: {', '.join(result['skipped'])}")
-                    if result["pruned"]:
-                        print(f"  Pruned {len(result['pruned'])} old backup(s)")
-                else:
-                    backups = backup.list_backups()
-                    if not backups:
-                        print("  No backups yet. Run 'backup' to create one.")
-                    else:
-                        print(f"  Backups ({len(backups)}):")
-                        for b in backups:
-                            print(f"    {b['name']} ({b['size_bytes'] / 1024:.0f} KB)")
-
-            elif user_input.lower() in ("health", "health check", "status check"):
-                from healthcheck import report_text
-
-                print("  " + report_text().replace("\n", "\n  "))
-
-            elif user_input.lower() in ("selfmod log", "self-mod log", "audit selfmod", "selfmod audit"):
-                from action_sandbox import get_self_mod_audit
-
-                entries = get_self_mod_audit(limit=20)
-                if not entries:
-                    print("  No self-modifications recorded yet.")
-                else:
-                    print(f"  Self-modification audit ({len(entries)}):")
-                    for e in entries:
-                        print(f"    [{e['ts'][:19]}] {e['target']} → {e['outcome']}")
-
-            elif user_input.lower().startswith("memory prune") or user_input.lower().startswith("prune memory"):
-                from memory import prune_old_memories
-
-                parts = user_input.split()
-                days = 30
-                for p in parts:
-                    if p.isdigit():
-                        days = int(p)
-                print(f"  Pruning memories older than {days} days...")
-                prune_old_memories(days=days)
-
-            elif user_input.lower().strip() in ("session", "sessions", "session list"):
-                _print_sessions()
-
-            elif user_input.lower().startswith("session new"):
-                from session_store import create_session
-
-                name = user_input[11:].strip()
-                meta = create_session(name or None)
-                _session_id = meta["id"]
-                print(f"  Switched to new session '{meta['name']}' ({meta['id']}).")
-
-            elif user_input.lower().startswith("session switch") or user_input.lower().startswith("session use"):
-                from session_store import list_sessions
-
-                target = user_input.split(None, 2)[-1].strip().lower()
-                found = None
-                for s in list_sessions():
-                    if target in (s["id"].lower(), s["name"].lower()):
-                        found = s
-                        break
-                if found:
-                    _session_id = found["id"]
-                    print(f"  Switched to session '{found['name']}' ({found['id']}).")
-                else:
-                    print(f"  No session matches '{target}'. Use 'session list' to see sessions.")
-
-            elif user_input.lower().startswith("session rename"):
-                from session_store import rename_session
-
-                parts = user_input.split(None, 3)
-                if len(parts) < 4:
-                    print("  Usage: session rename <id> <new name>")
-                else:
-                    meta = rename_session(parts[2], parts[3])
-                    if not meta:
-                        print(f"  Session '{parts[2]}' not found.")
-                    else:
-                        print(f"  Renamed to '{meta['name']}'.")
-
-            elif user_input.lower().startswith("session delete"):
-                from session_store import delete_session
-
-                target = user_input.split(None, 2)[-1].strip()
-                if not target:
-                    print("  Usage: session delete <id>")
-                elif target == _session_id:
-                    print("  Can't delete the active session. Switch first (session switch <id>).")
-                elif delete_session(target):
-                    print(f"  Deleted session '{target}'.")
-                else:
-                    print(f"  Session '{target}' not found.")
-
-            elif user_input.lower().startswith("session reset"):
-                from brain import reset_conversation
-
-                reset_conversation(_session_id)
-                print(f"  Reset session '{_session_id}' — history cleared.")
+            elif handle_local_command(user_input):
+                continue
 
             else:
                 handle_input(user_input)
+
+
+def handle_local_command(text: str) -> bool:
+    """Local command surface shared by the REPL and the TUI console.
+
+    Returns True when the text was handled as a local command, False
+    when the caller should route it to the brain (process).
+    """
+    global _current_mode, _paste_buffer, _session_id
+
+    if text.strip().startswith("//"):
+        _handle_slash_slash(text.strip())
+
+        return True
+    if text.lower() in ("quit", "exit", "q"):
+        speak("Goodbye.")
+        wait_for_speech()
+        sys.exit(0)
+
+        return True
+    if text.lower() == "wake":
+        import wakeword
+
+        wakeword.start(on_wake_word)
+        print("  Wake word active — say 'Hey Jarvis' anytime.\n")
+
+        return True
+    if text.lower() in ("plugins", "plugins list"):
+        from plugin_manager import print_plugin_status
+
+        print_plugin_status()
+
+        return True
+    if text.lower() == "plugins reload":
+        from plugin_manager import reload_plugins
+
+        print("  Reloading plugins...")
+        results = reload_plugins()
+        loaded = sum(1 for r in results if r.get("ok"))
+        print(f"  Loaded {loaded}/{len(results)} plugins.")
+
+        return True
+    if text.lower().startswith("plugin install "):
+        source = text[len("plugin install ") :].strip()
+        from plugin_manager import install_plugin
+
+        result = install_plugin(source)
+        if result.get("ok"):
+            print(f"  Installed plugin: {result['name']}")
+        else:
+            print(f"  Failed: {result.get('error', 'unknown')}")
+
+        return True
+    if text.lower() in ("workflows", "wf list"):
+        from workflow_engine import list_workflows
+
+        for w in list_workflows():
+            tag = "builtin" if w.get("builtin") else "user"
+            print(f"  [{tag}] {w['name']}: {w['description']}")
+
+        return True
+    if text.lower().startswith("workflow run ") or text.lower().startswith("wf run "):
+        parts = text.split(maxsplit=2)
+        wf_name = parts[2] if len(parts) > 2 else ""
+        from workflow_engine import run_workflow
+
+        print(f"  Running workflow '{wf_name}'...")
+        result = run_workflow(wf_name)
+        if result.get("ok"):
+            print(f"  Done. Result: {result['result'][:300]}")
+        else:
+            print(f"  Failed: {result.get('error', 'unknown')}")
+
+        return True
+    if text.lower() in ("wf history", "workflow history"):
+        from workflow_engine import get_run_history
+
+        for h in get_run_history(10):
+            print(f"  #{h['id']} {h['workflow']} — {h['status']} ({h.get('started', '?')[:19]})")
+
+        return True
+    if text.lower().startswith("ingest "):
+        path = text[7:].strip()
+        from rag_memory import index_folder
+
+        print(f"  Indexing {path}...")
+        files, chunks = index_folder(path)
+        print(f"  Indexed {files} files, {chunks} chunks")
+
+        return True
+    if text.lower().startswith("rag search "):
+        query = text[11:].strip()
+        from rag_memory import search_rag_structured
+
+        result = search_rag_structured(query)
+        if result.get("results"):
+            for r in result["results"]:
+                print(f"  [{r['source']}] (score={r['score']}): {r['text'][:200]}")
+        else:
+            print("  No results found.")
+
+        return True
+    if text.lower() in ("rag prune", "rag clean"):
+        from rag_memory import prune_stale_entries
+
+        deleted = prune_stale_entries(90)
+        print(f"  Pruned {deleted} stale chunks older than 90 days.")
+
+        return True
+    if text.lower() == "rag stats":
+        from rag_memory import get_rag_stats
+
+        stats = get_rag_stats()
+        print(f"  Files: {stats.get('total_files', 0)}")
+        print(f"  Chunks: {stats.get('total_chunks', 0)}")
+        print(f"  BM25 ready: {stats.get('bm25_ready', '?')}")
+
+        return True
+    if text.lower() in ("triggers", "trigger list"):
+        from trigger_engine import list_triggers
+
+        for t in list_triggers():
+            status = "✓" if t["enabled"] else "✗"
+            print(f"  [{t['id']}] {status} {t['name']} ({t['trigger_type']}/{t['action_type']}) — {t.get('description', '')}")
+            if t.get("next_fire"):
+                print(f"       next: {t['next_fire']}, count: {t['fire_count']}")
+
+        return True
+    if text.lower().startswith("trigger add "):
+        from trigger_engine import create_trigger
+
+        parts = text.split(None, 5)
+        if len(parts) < 5:
+            print("  Usage: trigger add <name> <type> <schedule> <action_type> <action_target> [description]")
+            print("  Types: cron, interval, once, event")
+            print("  Action types: workflow, tool, prompt")
+            print("  Examples:")
+            print("    trigger add cleanup interval 6h tool organize_downloads")
+            print("    trigger add briefing cron '0 8 * * *' prompt 'give me a morning briefing'")
+            print("    trigger add weather_once once 2026-06-22T09:00:00 tool get_weather")
+        else:
+            try:
+                name = parts[2]
+                t = parts[3]
+                sched = parts[4]
+                a_type = parts[5].split()[0] if len(parts) > 5 else ""
+                rest = text.split(None, 6)
+                a_target = rest[6].split(" ", 1)[0] if len(rest) > 6 else ""
+                desc = rest[6].split(" ", 1)[1] if len(rest) > 6 and " " in rest[6] else ""
+                t = create_trigger(name, t, sched, a_type, a_target, {}, desc)
+                print(f"  Created trigger [{t['id']}] {t['name']}")
+            except (IndexError, ValueError) as e:
+                print(f"  Error: {e}")
+
+        return True
+    if text.lower().startswith("trigger remove ") or text.lower().startswith("trigger delete "):
+        from trigger_engine import delete_trigger
+
+        try:
+            tid = int(text.split()[-1])
+            if delete_trigger(tid):
+                print(f"  Deleted trigger [{tid}]")
+            else:
+                print(f"  Trigger [{tid}] not found")
+        except (IndexError, ValueError):
+            print("  Usage: trigger remove <id>")
+
+        return True
+    if text.lower().startswith("trigger pause "):
+        from trigger_engine import disable_trigger
+
+        try:
+            tid = int(text.split()[-1])
+            trig = disable_trigger(tid)
+            print(f"  Paused trigger [{tid}] {trig.get('name', '')}")
+        except (IndexError, ValueError):
+            print("  Usage: trigger pause <id>")
+
+        return True
+    if text.lower().startswith("trigger resume "):
+        from trigger_engine import enable_trigger
+
+        try:
+            tid = int(text.split()[-1])
+            trig = enable_trigger(tid)
+            print(f"  Resumed trigger [{tid}] {trig.get('name', '')}")
+        except (IndexError, ValueError):
+            print("  Usage: trigger resume <id>")
+
+        return True
+    if text.lower() == "trigger history" or text.lower() == "trigger log":
+        from trigger_engine import get_trigger, get_trigger_history
+
+        for h in get_trigger_history(limit=20):
+            trig = get_trigger(h["trigger_id"]) or {}
+            trig_name = trig.get("name", f"id={h['trigger_id']}")
+            status_icon = "✓" if h["status"] == "done" else "✗"
+            print(f"  [{h['id']}] {status_icon} {trig_name} @ {h['triggered_at']} ({h['duration_ms']}ms)")
+            if h.get("error"):
+                print(f"       error: {h['error']}")
+
+        return True
+    if text.lower().startswith("vision analyze "):
+        from tools.vision_tools import analyze_image
+
+        path = text[15:].strip()
+        result = analyze_image(path=path)
+        print(f"  {result[:300]}")
+
+        return True
+    if text.lower().startswith("vision ocr "):
+        from tools.vision_tools import ocr_document
+
+        path = text[11:].strip()
+        result = ocr_document(path)
+        print(f"  {result[:300]}")
+
+        return True
+    if text.lower().startswith("vision video "):
+        from tools.vision_tools import analyze_video
+
+        parts = text[13:].strip().split()
+        path = parts[0] if parts else ""
+        ts = parts[1] if len(parts) > 1 else "0"
+        result = analyze_video(path, timestamps=ts)
+        print(f"  {result[:300]}")
+
+        return True
+    if text.lower() in ("agent list", "agents"):
+        from agent import list_agents
+
+        agents = list_agents()
+        if not agents:
+            print("  No agents running.")
+        else:
+            for a in agents:
+                ok = a.get("successful_steps", 0)
+                print(f"  [{a['id']}] {a['status']} — {a['goal'][:60]} ({a['step_count']} steps, {ok} ok)")
+
+        return True
+    if text.lower().startswith("agent stop "):
+        from agent import stop_agent
+
+        aid = text.split(None, 2)[-1]
+        if stop_agent(aid):
+            print(f"  Stopped agent {aid}")
+        else:
+            print(f"  Agent {aid} not found")
+
+        return True
+    if text.lower() in ("graph stats", "graph summary"):
+        from graph_memory import get_graph_summary
+
+        print(f"  {get_graph_summary()}")
+
+        return True
+    if text.lower().startswith("graph extract "):
+        from graph_memory import extract_entities_relations
+
+        text = text.split(None, 2)[-1]
+        results = extract_entities_relations(text)
+        print(f"  Extracted {len(results)} relationship(s)")
+        for r in results:
+            print(f"    {r['entity1']} --[{r['relationship']}]--> {r['entity2']}")
+
+        return True
+    if text.lower().startswith("graph neighbors "):
+        from graph_memory import query_relationships, search_neighbors
+
+        entity = text.split(None, 2)[-1]
+        print(f"  {query_relationships(entity)}")
+        neighbors = search_neighbors(entity)
+        if neighbors:
+            print(f"  Neighbors: {', '.join(n['entity'] for n in neighbors)}")
+
+        return True
+    if text.lower().startswith("graph search "):
+        from graph_memory import hybrid_graph_search
+
+        query = text.split(None, 2)[-1]
+        results = hybrid_graph_search(query)
+        if results:
+            for r in results:
+                neighs = ", ".join(r.get("neighbors", []))
+                print(f"  [{r['entity']}] ({r['entity_type']}) score={r['score']} — neighbors: {neighs}")
+        else:
+            print("  No graph matches.")
+
+        return True
+    if text.lower() in ("mic", "switch mic"):
+        input_devices = list_input_devices()
+        if input_devices:
+            try:
+                choice = input("  Select mic index: ").strip()
+                if choice.isdigit() and int(choice) in input_devices:
+                    _INPUT_DEVICE_INDEX = int(choice)
+                    mic = sd.query_devices(_INPUT_DEVICE_INDEX)
+                    print(f"  Mic switched to [{_INPUT_DEVICE_INDEX}] {mic.get('name', 'Unknown')}")
+                else:
+                    print("  Invalid index.")
+            except (EOFError, KeyboardInterrupt):
+                print("  Mic selection cancelled.")
+
+        return True
+    if text.lower() in ("/context", "context"):
+        try:
+            from brain import get_conversation_context
+
+            ctx = get_conversation_context()
+            print(f"  State: {ctx['state']}")
+            print(f"  Problem: {ctx['last_problem'][:80] if ctx.get('last_problem') else 'none'}")
+            print(f"  Solution: {ctx['last_solution'][:80] if ctx.get('last_solution') else 'none'}")
+            print(f"  Intent: {ctx.get('last_intent', '?')}")
+            print(f"  Provider: {ctx.get('last_provider', '?')}")
+            print(f"  Tools: {', '.join(ctx.get('last_tools', [])) or 'none'}")
+            print(f"  Fragment awaiting: {ctx.get('fragment_awaiting_context', False)}")
+        except Exception as e:
+            print(f"  Context error: {e}")
+
+        return True
+    if text.lower() in ("/provider-status", "/ps", "/providers"):
+        try:
+            status = get_runtime_status()
+            now = datetime.datetime.now().timestamp()
+            print("\n=== Provider Status ===")
+            print(f"{'Provider':<25} {'Status':<20} {'Health':<8} {'Failures':<8}")
+            print("-" * 65)
+            all_providers = set(_provider_health_scores.keys())
+            for p in status.get("providers", {}):
+                all_providers.add(p)
+            for provider in sorted(all_providers):
+                if provider == "huggingface":
+                    continue
+                backoff = _provider_backoff_until.get(provider, 0)
+                health = _provider_health_scores.get(provider, 100)
+                failures = _provider_consecutive_failures.get(provider, 0)
+                if backoff > now:
+                    remaining = int(backoff - now)
+                    status_str = f"BACKED OFF ({remaining}s)"
+                else:
+                    status_str = "OK"
+                print(f"  {provider:<25} {status_str:<20} {health:<8} {failures:<8}")
+            print()
+        except Exception as e:
+            print(f"  Provider status error: {e}")
+
+        return True
+    if text.lower().startswith("/mode") or text.lower().startswith("/m "):
+        parts = text.split()
+        mode_name = parts[-1].lower() if len(parts) > 1 else ""
+        mode_map = {"text": InputMode.TEXT, "t": InputMode.TEXT, "paste": InputMode.PASTE, "p": InputMode.PASTE, "queue": InputMode.QUEUE, "q": InputMode.QUEUE}
+        if mode_name in mode_map:
+            _current_mode = mode_map[mode_name]
+            _paste_buffer = []
+            print(f"  Mode switched to {_current_mode.upper()}")
+            if _current_mode == InputMode.PASTE:
+                print("  Paste content, blank lines are kept. Type '/' to submit, '/cancel' to discard.")
+        else:
+            print("  Modes: /mode text|paste|queue  (or /m t|p|q)")
+            print(f"  Current: {_current_mode.upper()}")
+
+        return True
+    if text.lower() in ("/queue show", "/q show", "queue show"):
+        if _queue_buffer:
+            print(f"  Queue ({len(_queue_buffer)} items):")
+            for i, item in enumerate(_queue_buffer, 1):
+                print(f"    {i}. {item[:120]}")
+        else:
+            print("  Queue is empty.")
+
+        return True
+    if text.lower() in ("/queue clear", "/q clear", "queue clear"):
+        _queue_buffer.clear()
+        print("  Queue cleared.")
+
+        return True
+    if text.lower() in ("test", "test run", "test logs", "test status", "test report",
+                                "test findings", "test history", "test stop", "self-test", "selftest") \
+            or text.lower().startswith(("test confirm ", "test dismiss ", "self-test ", "selftest ")):
+        from self_test.agent import handle_command
+
+        print("  " + handle_command(text).replace("\n", "\n  "))
+
+        return True
+    if text.lower() in ("backup", "backup now", "backups", "backup list"):
+        import backup
+
+        if text.lower() in ("backup", "backup now"):
+            print("  Backing up state...")
+            result = backup.run_backup()
+            print(f"  Backup: {result['backup_dir']}")
+            print(f"  Copied: {', '.join(result['copied']) or 'none'}")
+            if result["skipped"]:
+                print(f"  Skipped: {', '.join(result['skipped'])}")
+            if result["pruned"]:
+                print(f"  Pruned {len(result['pruned'])} old backup(s)")
+        else:
+            backups = backup.list_backups()
+            if not backups:
+                print("  No backups yet. Run 'backup' to create one.")
+            else:
+                print(f"  Backups ({len(backups)}):")
+                for b in backups:
+                    print(f"    {b['name']} ({b['size_bytes'] / 1024:.0f} KB)")
+
+        return True
+    if text.lower() in ("health", "health check", "status check"):
+        from healthcheck import report_text
+
+        print("  " + report_text().replace("\n", "\n  "))
+
+        return True
+    if text.lower() in ("selfmod log", "self-mod log", "audit selfmod", "selfmod audit"):
+        from action_sandbox import get_self_mod_audit
+
+        entries = get_self_mod_audit(limit=20)
+        if not entries:
+            print("  No self-modifications recorded yet.")
+        else:
+            print(f"  Self-modification audit ({len(entries)}):")
+            for e in entries:
+                print(f"    [{e['ts'][:19]}] {e['target']} → {e['outcome']}")
+
+        return True
+    if text.lower().startswith("memory prune") or text.lower().startswith("prune memory"):
+        from memory import prune_old_memories
+
+        parts = text.split()
+        days = 30
+        for p in parts:
+            if p.isdigit():
+                days = int(p)
+        print(f"  Pruning memories older than {days} days...")
+        prune_old_memories(days=days)
+
+        return True
+    if text.lower().strip() in ("session", "sessions", "session list"):
+        _print_sessions()
+
+        return True
+    if text.lower().startswith("session new"):
+        from session_store import create_session
+
+        name = text[11:].strip()
+        meta = create_session(name or None)
+        _session_id = meta["id"]
+        print(f"  Switched to new session '{meta['name']}' ({meta['id']}).")
+
+        return True
+    if text.lower().startswith("session switch") or text.lower().startswith("session use"):
+        from session_store import list_sessions
+
+        target = text.split(None, 2)[-1].strip().lower()
+        found = None
+        for s in list_sessions():
+            if target in (s["id"].lower(), s["name"].lower()):
+                found = s
+                break
+        if found:
+            _session_id = found["id"]
+            print(f"  Switched to session '{found['name']}' ({found['id']}).")
+        else:
+            print(f"  No session matches '{target}'. Use 'session list' to see sessions.")
+
+        return True
+    if text.lower().startswith("session rename"):
+        from session_store import rename_session
+
+        parts = text.split(None, 3)
+        if len(parts) < 4:
+            print("  Usage: session rename <id> <new name>")
+        else:
+            meta = rename_session(parts[2], parts[3])
+            if not meta:
+                print(f"  Session '{parts[2]}' not found.")
+            else:
+                print(f"  Renamed to '{meta['name']}'.")
+
+        return True
+    if text.lower().startswith("session delete"):
+        from session_store import delete_session
+
+        target = text.split(None, 2)[-1].strip()
+        if not target:
+            print("  Usage: session delete <id>")
+        elif target == _session_id:
+            print("  Can't delete the active session. Switch first (session switch <id>).")
+        elif delete_session(target):
+            print(f"  Deleted session '{target}'.")
+        else:
+            print(f"  Session '{target}' not found.")
+
+        return True
+    if text.lower().startswith("session reset"):
+        from brain import reset_conversation
+
+        reset_conversation(_session_id)
+        print(f"  Reset session '{_session_id}' — history cleared.")
+
+        handle_input(text)
+        return True
+    return False
+def _handle_slash_slash(cmd: str):
+    """Local command dispatch for the // namespace (//help, ...).
+
+    Only // commands are handled here; single-slash (/help) intentionally
+    falls through to the model — the easter-egg namespace.
+    """
+    from commands_registry import CAPABILITIES, REGISTRY
+
+    words = cmd.split(None, 1)
+    base = words[0].lower()
+    arg = words[1] if len(words) > 1 else ""
+
+    if base in ("//paste", "//clipboard"):
+        try:
+            import pyperclip
+
+            full_text = pyperclip.paste()
+        except Exception as e:
+            print(f"  Clipboard unavailable: {e}")
+            return
+        full_text = (full_text or "").strip()
+        if not full_text:
+            print("  Clipboard is empty.")
+            return
+        if len(full_text) > 2000:
+            print(f"  Summarizing paste ({len(full_text)} chars)...")
+            full_text = _summarize_paste(full_text)
+        print(f"  Submitting clipboard ({len(full_text)} chars) as one message.")
+        handle_input(full_text)
+        return
+
+    if base in ("//help", "//commands", "//?"):
+        if arg:
+            target = arg.lower()
+            matches = [
+                e for e in REGISTRY
+                if any(target == n.lower() for n in e["names"])
+            ]
+            if not matches:
+                print(f"  No command '{arg}'. Try '//help' for the full list.")
+                return
+            for e in matches:
+                print(f"  {e['usage']}")
+                print(f"    {e['about']}")
+                if len(e['names']) > 1:
+                    print(f"    Aliases: {', '.join(e['names'])}")
+            return
+
+        print("  ── J.A.R.V.I.S. commands (//help <command> for details) ──")
+        terminal = [e for e in REGISTRY if e["surface"] in ("terminal", "both")]
+        chat = [e for e in REGISTRY if e["surface"] == "chat"]
+        for e in terminal:
+            head = e["names"][0]
+            extra = f" (+{len(e['names']) - 1} aliases)" if len(e["names"]) > 1 else ""
+            print(f"  {head:<28} {e['about'][:60]}{extra}")
+        print("\n  ── Chat commands (typed or spoken anywhere) ──")
+        for e in chat:
+            print(f"  {e['names'][0]:<28} {e['about'][:60]}")
+            if len(e["names"]) > 1:
+                print(f"  {'':<28} aliases: {', '.join(e['names'][1:])}")
+        print("\n  ── Capabilities (just ask in plain language) ──")
+        for name, blurb in CAPABILITIES:
+            print(f"  {name:<28} {blurb}")
+        print("\n  Single-slash commands (/help) go to the model — easter eggs "
+              "live there soon. Full reference: COMMANDS.md")
+        return
+
+    print(f"  Unknown command '{cmd}'. Try '//help'.")
 
 
 def _print_sessions():
