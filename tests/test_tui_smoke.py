@@ -12,7 +12,7 @@ os.environ.setdefault("JARVIS_TUI_VISION", "0")
 
 from textual.widgets import RichLog, Static, TabbedContent  # noqa: E402
 
-from tui import Composer, JarvisConsole  # noqa: E402
+from tui import Composer, JarvisConsole, command_hint  # noqa: E402
 
 
 def test_tui_boots_and_composes():
@@ -50,9 +50,11 @@ def test_tui_boots_and_composes():
             app._flush_sink()
             rail = app.query_one("#activity", RichLog)
             assert any("hello from a worker thread" in str(line) for line in rail.lines)
-            # Session-aware local command surface
-            assert app._handle_local("session list") is True
-            assert app._handle_local("not a command, please route to brain") is False
+            # Fast-local surface is synchronous; full commands run in a worker
+            assert app._fast_local("quit") is True
+            assert app._fast_local("session list") is False
+            assert command_hint("session ls") is not None
+            assert command_hint("not a command, please route to brain") is None
             # Vision toggle flips the mode (stream logic exercised with a stub)
             class FakeStream:
                 retina_mode = False

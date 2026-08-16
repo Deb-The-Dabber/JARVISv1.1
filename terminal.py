@@ -1172,7 +1172,6 @@ def handle_local_command(text: str) -> bool:
         reset_conversation(_session_id)
         print(f"  Reset session '{_session_id}' — history cleared.")
 
-        handle_input(text)
         return True
     return False
 def _handle_slash_slash(cmd: str):

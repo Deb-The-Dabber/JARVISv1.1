@@ -3,13 +3,14 @@
 Layout:
     header (session, status, mic) | footer (bindings)
     left: TabbedContent [MAIN | SYSTEM | BRAIN | MEMORY | VISION | WORKFLOWS | TOOLS]
-      MAIN = transcript (session-backed) + multi-line composer
+      MAIN = transcript (session-backed) + status strip + multi-line composer
     right: Activity rail (tool calls, subagent progress, safety, latency)
 
 Env:
     JARVIS_TUI=0                 force classic REPL (TUI is the default when stdin/stdout are TTYs)
     JARVIS_TUI_ANNOUNCE=1        speak panel-init flavor lines
     JARVIS_TUI_VISION=1          auto-start the camera when VISION opens
+    JARVIS_CAMERA_INDEX=<0-4>    force a specific camera index (auto-pick otherwise)
 """
 
 from __future__ import annotations
@@ -36,6 +37,40 @@ _ANNOUNCE = os.environ.get("JARVIS_TUI_ANNOUNCE", "0") == "1"
 _AUTOSTART_VISION = os.environ.get("JARVIS_TUI_VISION", "1") == "1"
 
 _RAMP = " .:-=+*#%@"
+
+# First tokens of the local command surface (terminal.handle_local_command).
+# Used only for near-miss hints — never to block chat.
+_COMMAND_KEYWORDS = frozenset(
+    {
+        "session", "sessions", "backup", "backups", "health", "plugins", "plugin",
+        "workflow", "wf", "ingest", "rag", "trigger", "triggers", "vision",
+        "agent", "agents", "graph", "mic", "context", "mode", "queue", "test",
+        "self-test", "selftest", "selfmod", "self-mod", "memory", "prune",
+    }
+)
+
+
+def command_hint(text: str) -> str | None:
+    """Near-miss hint for command-shaped input that wasn't an exact match.
+
+    Never matches free-form chat: only `//`-prefixed text or short
+    (<= 3 words) input whose first token is a command keyword.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    if t.startswith("//"):
+        base = t.split(None, 1)[0]
+        return f"Unknown command '{base}'. Try //help (e.g. //help session)."
+    words = t.split()
+    if len(words) > 3:
+        return None
+    if words[0] in _COMMAND_KEYWORDS:
+        return (
+            f"'{text.strip()}' looks like a local command, but exact matches run locally. "
+            "Try //help for the full list."
+        )
+    return None
 
 
 # ──────────────────────────────────────────────────────────
@@ -157,14 +192,75 @@ def _ascii_frame(gray, cols: int = 64, rows: int = 24) -> str:
     return "\n".join(char_rows)
 
 
+def _open_camera(idx: int):
+    """Open camera idx with sane capture settings, or None on failure."""
+    import cv2
+
+    try:
+        cap = cv2.VideoCapture(idx)
+        if not cap or not cap.isOpened():
+            return None
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 10)
+        except Exception:
+            pass
+        return cap
+    except Exception:
+        return None
+
+
+def _find_camera_index() -> int:
+    """Pick the camera that actually delivers image content.
+
+    macOS machines often expose virtual/Continuity cameras at low indices
+    that open but only ever produce black frames. We probe 0..4 and pick
+    the first one whose frame variance is highest (black ≈ variance 0).
+    JARVIS_CAMERA_INDEX forces an index and skips probing.
+    """
+    override = os.environ.get("JARVIS_CAMERA_INDEX")
+    if override is not None:
+        try:
+            return max(int(override), 0)
+        except ValueError:
+            pass
+    import cv2
+
+    best, best_var = 0, -1.0
+    for i in range(5):
+        cap = _open_camera(i)
+        if cap is None:
+            continue
+        variance = 0.0
+        try:
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+                variance = float(gray.var())
+        except Exception:
+            pass
+        cap.release()
+        if variance > best_var:
+            best, best_var = i, variance
+    if best_var < 0:
+        return -1
+    return best
+
+
 # ──────────────────────────────────────────────────────────
 # VISION STREAM THREAD
 # ──────────────────────────────────────────────────────────
 class VisionStream(threading.Thread):
-    """Camera → retina/camera ASCII frames at ~6 fps, only while active."""
+    """Camera → retina/camera ASCII frames at ~6 fps, only while active.
+
+    Survives camera failures: retries every few seconds, and surfaces
+    permission/black-frame hints in the pane status instead of dying.
+    """
 
     LEAK = 0.90
     THRESHOLD = 0.15
+    RETRY_SECONDS = 3.0
 
     def __init__(self, on_frame, on_status, active_check) -> None:
         super().__init__(daemon=True, name="jarvis-vision")
@@ -181,44 +277,80 @@ class VisionStream(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-    def _emit_status(self, msg: str) -> None:
+    def _emit_status(self, msg: str, style: str = "dim") -> None:
         try:
-            self._on_status(msg)
+            self._on_status(msg, style)
         except Exception:
             pass
 
-    def run(self) -> None:
-        import cv2
-        import numpy as np
+    def _wait(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end and not self._stop.is_set():
+            time.sleep(0.25)
 
+    def run(self) -> None:
         try:
             self.retina_cls = load_artificial_retina()
         except Exception as e:
-            self._emit_status(f"RETINA OFFLINE — could not load ArtificialRetina: {e}")
+            self._emit_status(f"RETINA OFFLINE — could not load ArtificialRetina: {e}", "yellow")
             self.retina_cls = None
 
-        camera = None
-        try:
-            camera = cv2.VideoCapture(0)
-            if not camera.isOpened():
-                raise RuntimeError("could not open camera (index 0)")
-        except Exception as e:
-            self._emit_status(f"CAMERA OFFLINE — {e}")
-            camera = None
-
-        if camera is None:
-            self._emit_status("Vision offline — no camera. Retina math idle.")
+        self._emit_status("Vision starting — scanning for cameras…", "dim")
+        idx = _find_camera_index()
+        if idx < 0:
+            self._emit_status(
+                "CAMERA OFFLINE — no accessible camera. Grant camera permission to this "
+                "terminal app (System Settings → Privacy & Security → Camera), then press R.",
+                "red",
+            )
             return
 
-        self._emit_status("Camera online.")
+        while not self._stop.is_set():
+            camera = _open_camera(idx)
+            if camera is None:
+                self._emit_status(
+                    f"CAMERA OFFLINE (index {idx}) — grant camera permission to this terminal app "
+                    "(System Settings → Privacy & Security → Camera), then press R.",
+                    "red",
+                )
+                self._wait(self.RETRY_SECONDS)
+                continue
+            self._emit_status(f"Camera online (index {idx}).", "green")
+            self._stream(camera, idx)
+            camera.release()
+            if self._stop.is_set():
+                break
+            self._emit_status("Camera dropped — retrying…", "yellow")
+            self._wait(self.RETRY_SECONDS)
 
+    def _stream(self, camera, idx: int) -> None:
+        import cv2
+        import numpy as np
+
+        black_frames = 0
+        black_hint_shown = False
         while not self._stop.is_set():
             if not self._active_check():
                 time.sleep(0.2)
                 continue
             ok, frame = camera.read()
-            if not ok:
-                continue
+            if not ok or frame is None:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            variance = float(gray.var())
+            if variance < 2.0:
+                black_frames += 1
+                if black_frames >= 10 and not black_hint_shown:
+                    black_hint_shown = True
+                    self._emit_status(
+                        f"Camera {idx} is open but frames are black — likely a virtual/"
+                        "Continuity camera. Set JARVIS_CAMERA_INDEX=0..4 in .env to pick "
+                        "the physical webcam (auto-pick prefers it).",
+                        "yellow",
+                    )
+            else:
+                black_frames = 0
+                black_hint_shown = False
             now = time.perf_counter()
             if now - self._last_render < 0.18:
                 continue
@@ -245,16 +377,10 @@ class VisionStream(threading.Thread):
                         f"threshold {self.THRESHOLD}",
                     )
                 except Exception as e:  # noqa: BLE001
-                    self._emit_status(f"Retina error: {e}")
+                    self._emit_status(f"Retina error: {e}", "yellow")
             else:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                small = cv2.resize(gray, (64, 24), interpolation=cv2.INTER_AREA)
-                norm = small.astype(np.float32) / 255.0
-                frame_text = _ascii_frame(norm)
+                frame_text = _ascii_frame(gray / 255.0)
                 self._on_frame(frame_text, "CAMERA VIEW — press R for artificial retina")
-
-        if camera is not None:
-            camera.release()
 
 
 # ──────────────────────────────────────────────────────────
@@ -282,22 +408,35 @@ class VisionPane(Vertical):
 # ──────────────────────────────────────────────────────────
 class JarvisConsole(App):
     TITLE = "J.A.R.V.I.S."
+    THEME = "catppuccin-mocha"
+
     CSS = """
+    $primary: #89b4fa;
+    $secondary: #b4befe;
+    $accent: #89b4fa;
+    $success: #a6e3a1;
+    $warning: #f9e2af;
+    $error: #f38ba8;
+    $panel: #313244;
+    $surface: #45475a;
+    $text-muted: #7f849c;
+    $border: #45475a;
+
     #header { height: 1; background: $panel; color: $text; padding: 0 1; }
-    #header .brand { color: $accent; text-style: bold; }
-    #header .badge { color: $success; text-style: bold; }
-    #header .dim { color: $text-muted; }
-    #transcript { border: round $panel; padding: 0 1; }
-    #activity { border: round $panel; padding: 0 1; }
+    #transcript { border: none; padding: 0 1; }
+    #activity { border: round $border; padding: 0 1; }
     #composer-wrap { height: auto; }
-    Composer { height: 3; border: round $accent; }
-    #vision-frame { height: 24; }
+    Composer { height: 3; border: round $border; background: $panel; }
+    Composer:focus { border: round $accent; }
+    #status-strip { height: 1; color: $text-muted; padding: 0 1; }
+    #vision-frame { height: 24; border: round $border; padding: 0 1; }
     #vision-status { color: $text-muted; }
-    Static.pane-label { color: $text-muted; margin: 0 0 1 1; }
+    Static.pane-label { color: $text-muted; margin: 0 0 1 1; text-style: bold; }
     #main-col { min-width: 60; }
     #rail-col { width: 44; }
+    TabbedContent Tab { padding: 0 1; }
+    TabbedContent Tab.-active { color: $accent; text-style: bold; }
     """
-
     BINDINGS = [
         Binding("ctrl+l", "focus_main", "Main"),
         Binding("ctrl+t", "focus_tools", "Tools"),
@@ -325,6 +464,8 @@ class JarvisConsole(App):
         self._vision: VisionStream | None = None
         self._vision_hint_shown = False
         self._last_session = session_id
+        self._last_latency: float | None = None
+        self._last_role: str | None = None
 
     # ── live UI threading helpers ─────────────────────────
     def _rail(self, text: str, style: str = "dim") -> None:
@@ -339,7 +480,15 @@ class JarvisConsole(App):
 
     def _rail_ui(self, text: str, style: str = "dim") -> None:
         try:
-            self.query_one("#activity", RichLog).write(Text(text, style=style))
+            if style == "dim":
+                low = text.lower()
+                if any(k in low for k in ("error", "failed", "exception", "traceback", "cancelled")):
+                    style = "red"
+                elif any(k in low for k in ("warn", "not found", "no matches", "empty", "unknown")):
+                    style = "yellow"
+                elif text.strip().startswith(("✓", "✔", "done", "backup:", "switched", "camera online")):
+                    style = "green"
+            self.query_one("#activity", RichLog).write(Text(text.lstrip(), style=style))
         except Exception:
             pass
 
@@ -355,9 +504,17 @@ class JarvisConsole(App):
     def _transcript_line_ui(self, role: str, text: str) -> None:
         try:
             log = self.query_one("#transcript", RichLog)
-            prefix = "YOU   »" if role == "user" else "JARVIS »"
-            style = "bold cyan" if role == "user" else "green"
-            log.write(Text(f"{prefix} {text}", style=style))
+            if role == "user" and self._last_role == "assistant":
+                log.write("")
+            self._last_role = role
+            if role == "user":
+                prefix, pstyle, body_style = f"{'YOU':>8} »", "bold #89b4fa", "#89b4fa"
+            else:
+                prefix, pstyle, body_style = f"{'JARVIS':>8} »", "bold #a6e3a1", "#a6e3a1"
+            log.write(Text.assemble(
+                (prefix + " ", pstyle),
+                (text, body_style),
+            ))
             log.scroll_end(animate=False)
         except Exception:
             pass
@@ -437,6 +594,7 @@ class JarvisConsole(App):
             shown += 1
         if shown == 0:
             log.write(Text("Type a message below, or use //help.", style="dim"))
+        self._last_role = msgs[-1].get("role", "") if msgs else None
 
     def _refresh_transcript(self) -> None:
         # Session may have changed via local commands
@@ -458,12 +616,35 @@ class JarvisConsole(App):
         busy = "working…" if self._busy else "idle"
         header.update(
             Text.assemble(
-                ("◈ J.A.R.V.I.S.", "bold cyan"),
-                ("  session: ", "dim"),
-                (self._session_id, ""),
-                ("   ● ONLINE ", "bold green"),
-                (" " + rec, "red bold") if rec else "",
-                (f"  [{busy}]", "dim"),
+                ("◈ J.A.R.V.I.S.", "bold #89b4fa"),
+                ("  │ ", "dim"),
+                ("session ", "dim"),
+                (self._session_id, "#b4befe"),
+                ("  │ ", "dim"),
+                ("● ONLINE ", "bold #a6e3a1"),
+                (" " + rec, "bold #f38ba8") if rec else "",
+                (f"  [{busy}]", "dim") if not self._busy else ("  [working…]", "bold #f9e2af"),
+            )
+        )
+        self._refresh_status_strip()
+
+    def _refresh_status_strip(self) -> None:
+        try:
+            strip = self.query_one("#status-strip", Static)
+        except Exception:
+            return
+        busy = "working…" if self._busy else "idle"
+        btn = f"queue: {len(self._pending)}" if self._pending else ""
+        lat = f"last reply {self._last_latency:.1f}s" if self._last_latency else "no replies yet"
+        strip.update(
+            Text.assemble(
+                ("recording " if self._recording.is_set() else "listening ", "bold #f38ba8")
+                if self._recording.is_set() else ("ready ", ""),
+                ("· ", "dim"),
+                (busy, "bold #f9e2af" if self._busy else "#a6e3a1"),
+                ("  ·  ", "dim"),
+                (lat, "dim"),
+                (f"  ·  {btn}", "bold #f9e2af") if btn else "",
             )
         )
 
@@ -478,20 +659,12 @@ class JarvisConsole(App):
             return
         composer = self.query_one(Composer)
         composer.text = ""
-
-        if self._handle_local(text):
+        if self._fast_local(text):
             return
+        self._enqueue(text)
 
-        self._transcript_line("user", text)
-        if self._busy:
-            self._pending.append(text)
-            self._rail(f"Queued: {text[:80]}", "yellow")
-            return
-        self._busy = True
-        self._refresh_header()
-        threading.Thread(target=self._request_worker, args=(text,), daemon=True).start()
-
-    def _handle_local(self, text: str) -> bool:
+    def _fast_local(self, text: str) -> bool:
+        """Instant local handling that must never block or leave the UI thread."""
         lowered = text.lower()
         if lowered in ("quit", "exit", "q"):
             self.action_quit_app()
@@ -500,17 +673,75 @@ class JarvisConsole(App):
             self._rail("Wake-word mode lives in the classic REPL (JARVIS_TUI=0). Here: ctrl+r records.", "yellow")
             return True
         if lowered.startswith(("/mode", "/m ")):
-            self._rail(
-                "One input mode in the console. Enter sends; paste drops whole; //paste reads clipboard.",
-                "yellow",
-            )
+            self._rail("One input mode in the console. Enter sends; //paste reads clipboard.", "yellow")
             return True
-        if terminal.handle_local_command(text):
-            self._refresh_transcript()
+        if lowered in ("mic", "switch mic"):
+            self._rail("Mic source is auto-picked at startup (JARVIS_MIC_INDEX overrides). ctrl+r records.", "yellow")
+            return True
+        if lowered.startswith(("//paste", "//clipboard")):
+            threading.Thread(target=self._paste_worker, daemon=True).start()
             return True
         return False
 
-    def _request_worker(self, text: str) -> None:
+    def _paste_worker(self) -> None:
+        try:
+            import pyperclip
+
+            content = (pyperclip.paste() or "").strip()
+        except Exception as e:
+            self._rail(f"Clipboard unavailable: {e}", "red")
+            return
+        if not content:
+            self._rail("Clipboard is empty.", "yellow")
+            return
+        if len(content) > 2000:
+            self._rail(f"Summarizing {len(content)}-char paste…", "yellow")
+            content = terminal._summarize_paste(content)
+        self.call_from_thread(self._submit, content)
+
+    def _enqueue(self, text: str) -> None:
+        if self._busy:
+            self._pending.append(text)
+            self._rail(f"Queued: {text[:80]}", "yellow")
+            self._refresh_status_strip()
+            return
+        self._busy = True
+        self._refresh_header()
+        threading.Thread(target=self._task_worker, args=(text,), daemon=True).start()
+
+    def _task_worker(self, text: str) -> None:
+        """Local command (worker thread — the UI never blocks), else chat."""
+        t0 = time.perf_counter()
+        try:
+            handled = terminal.handle_local_command(text)
+        except SystemExit:
+            try:
+                self.call_from_thread(self.action_quit_app)
+            except RuntimeError:
+                pass
+            return
+        except Exception as e:  # noqa: BLE001
+            handled = True
+            self._rail(f"Command error: {e}", "red")
+        if not handled:
+            hint = command_hint(text)
+            if hint is not None:
+                self._rail(hint, "yellow")
+                self.call_from_thread(self._task_done)
+                return
+            self._chat(text)
+            return
+        self._rail(f"done in {(time.perf_counter() - t0) * 1000:.0f} ms", "dim")
+        try:
+            self.call_from_thread(self._refresh_transcript)
+        except RuntimeError:
+            pass
+        try:
+            self.call_from_thread(self._task_done)
+        except RuntimeError:
+            pass
+
+    def _chat(self, text: str) -> None:
         t0 = time.perf_counter()
         try:
             reply = self._brain.process(text, self._session_id)
@@ -519,8 +750,14 @@ class JarvisConsole(App):
                 self._rail("Request cancelled — reply discarded.", "yellow")
             else:
                 latency = (time.perf_counter() - t0) * 1000
+                self._last_latency = latency / 1000
                 self._rail(f"reply in {latency:.0f} ms", "dim")
+                self._transcript_line("user", text)
                 self._transcript_line("assistant", reply)
+                try:
+                    self.call_from_thread(self._refresh_status_strip)
+                except RuntimeError:
+                    pass
                 try:
                     from tts import speak, wait_for_speech
 
@@ -531,11 +768,15 @@ class JarvisConsole(App):
         except Exception as e:  # noqa: BLE001
             self._rail(f"Error: {e}", "red")
         finally:
-            self.call_from_thread(self._request_done)
+            try:
+                self.call_from_thread(self._task_done)
+            except RuntimeError:
+                pass
 
-    def _request_done(self) -> None:
+    def _task_done(self) -> None:
         self._busy = False
         self._refresh_header()
+        self._return_focus()
         if self._pending:
             nxt = self._pending.pop(0)
             self._submit(nxt)
@@ -669,7 +910,7 @@ class JarvisConsole(App):
             return
         self._vision.retina_mode = not self._vision.retina_mode
         mode = "RETINA" if self._vision.retina_mode else "CAMERA"
-        self._vision_status(f"Switched to {mode} view.")
+        self._vision_status(f"Switched to {mode} view.", "cyan")
         self._rail(f"Vision: {mode} view.", "cyan")
 
     def _vision_frame(self, ascii_frame: str, caption: str) -> None:
@@ -688,20 +929,41 @@ class JarvisConsole(App):
         except Exception:
             pass
 
-    def _vision_status(self, msg: str) -> None:
+    def _vision_status(self, msg: str, style: str = "dim") -> None:
         try:
             try:
-                self.call_from_thread(self._vision_status_ui, msg)
+                self.call_from_thread(self._vision_status_ui, msg, style)
             except RuntimeError:
-                self._vision_status_ui(msg)
+                self._vision_status_ui(msg, style)
         except Exception:
             pass
 
-    def _vision_status_ui(self, msg: str) -> None:
+    def _vision_status_ui(self, msg: str, style: str = "dim") -> None:
         try:
-            self.query_one("#vision-status", Static).update(msg)
+            self.query_one("#vision-status", Static).update(Text(msg, style=style))
         except Exception:
             pass
+
+    def _return_focus(self) -> None:
+        try:
+            self.query_one(Composer).focus()
+        except Exception:
+            pass
+
+    def on_mouse_down(self, event) -> None:
+        """Typing must always land in the composer — except interactive widgets
+        (composer/buttons) and the vision pane (R toggles retina)."""
+        widget = event.widget
+        if widget is None or isinstance(widget, (Composer, Button)):
+            return
+        if isinstance(widget, VisionPane):
+            return
+        ancestor = widget
+        while ancestor is not None:
+            if isinstance(ancestor, (VisionPane, Button, Composer)):
+                return
+            ancestor = ancestor.parent
+        self._return_focus()
 
     # ── panel refreshers ──────────────────────────────────
     def _sys_info_text(self) -> str:
@@ -851,6 +1113,7 @@ class JarvisConsole(App):
                         with VerticalScroll():
                             yield RichLog(id="transcript", markup=True, highlight=True, wrap=True, min_width=60)
                         with Vertical(id="composer-wrap"):
+                            yield Static("", id="status-strip")
                             yield Composer(placeholder="Type a message or task… Enter to send, ctrl+enter newline")
                     with TabPane("SYSTEM", id="system-tab"):
                         yield Static("Loading system…", id="system-pane")
@@ -875,10 +1138,17 @@ class JarvisConsole(App):
         pane_id = event.pane.id or ""
         if pane_id == "vision-tab":
             self._ensure_vision(start_thread=_AUTOSTART_VISION)
+            try:
+                self.query_one(VisionPane).focus()
+            except Exception:
+                pass
+            return
+        self._return_focus()
 
     @on(Button.Pressed, "#vision-toggle")
     def _on_vision_toggle(self, event: Button.Pressed) -> None:
         self.toggle_vision_mode()
+        self._return_focus()
 
 
 # ──────────────────────────────────────────────────────────
