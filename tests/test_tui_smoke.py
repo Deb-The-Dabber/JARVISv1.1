@@ -28,12 +28,12 @@ def test_tui_boots_and_composes():
             # Default tab is MAIN
             tabs = app.query_one(TabbedContent)
             assert "main-tab" in tabs.active
-            # Switch across every pane
-            for key in ("ctrl+g", "ctrl+p", "ctrl+m", "ctrl+w", "ctrl+t"):
+            # Switch across every pane (ctrl+1..7 — no TextArea conflicts)
+            for key in ("ctrl+2", "ctrl+3", "ctrl+4", "ctrl+6", "ctrl+7"):
                 await pilot.press(key)
                 await pilot.pause()
             # Vision tab loads the retina class without starting the camera
-            await pilot.press("ctrl+v")
+            await pilot.press("ctrl+5")
             await pilot.pause()
             status = app.query_one("#vision-status", Static).content
             assert status is not None

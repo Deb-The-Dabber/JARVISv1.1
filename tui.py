@@ -6,6 +6,13 @@ Layout:
       MAIN = transcript (session-backed) + status strip + multi-line composer
     right: Activity rail (tool calls, subagent progress, safety, latency)
 
+Keys: ctrl+1..7 switch panes (digit keys never collide with TextArea editing),
+ctrl+r record, ctrl+q quit, ctrl+c copy-with-text / cancel-when-empty.
+
+Performance: info panes refresh only while their tab is open, computed on a
+worker thread (no psutil/SQLite on the Textual loop); the camera streams only
+while the VISION tab is active; rail lines are capped.
+
 Env:
     JARVIS_TUI=0                 force classic REPL (TUI is the default when stdin/stdout are TTYs)
     JARVIS_TUI_ANNOUNCE=1        speak panel-init flavor lines
@@ -17,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
 import threading
 import time
@@ -37,6 +45,8 @@ _ANNOUNCE = os.environ.get("JARVIS_TUI_ANNOUNCE", "0") == "1"
 _AUTOSTART_VISION = os.environ.get("JARVIS_TUI_VISION", "1") == "1"
 
 _RAMP = " .:-=+*#%@"
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
 
 # First tokens of the local command surface (terminal.handle_local_command).
 # Used only for near-miss hints — never to block chat.
@@ -130,6 +140,22 @@ class Composer(TextArea):
             event.stop()
             event.prevent_default()
             self.action_submit()
+            return
+        if event.key == "ctrl+c":
+            # Fully owned by the composer: copy when text is present,
+            # cancel when empty (TextArea's copy is a no-op then).
+            event.stop()
+            event.prevent_default()
+            if not self.text.strip():
+                try:
+                    self.app.action_cancel()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.action_copy()
+                except Exception:
+                    pass
             return
         await super()._on_key(event)
 
@@ -393,7 +419,7 @@ class VisionPane(Vertical):
         yield Static("VISION — loading...", id="vision-status")
         yield Static("", id="vision-frame")
         yield Button("Toggle: Retina / Camera", id="vision-toggle", variant="primary")
-        yield Static("R toggles retina ↔ camera · ctrl+v back to conversation")
+        yield Static("R toggles retina ↔ camera · ctrl+1 back to conversation")
 
     def action_toggle_retina(self) -> None:
         app = self.app
@@ -437,16 +463,19 @@ class JarvisConsole(App):
     TabbedContent Tab { padding: 0 1; }
     TabbedContent Tab.-active { color: $accent; text-style: bold; }
     """
+    # ctrl+1..7 for panes — these keys never collide with TextArea's
+    # default bindings (ctrl+w/v are word-delete/paste there!), so the
+    # pane switches work even while typing in the composer.
     BINDINGS = [
+        Binding("ctrl+1", "focus_main", "Main"),
+        Binding("ctrl+2", "focus_system", "System"),
+        Binding("ctrl+3", "focus_brain", "Brain"),
+        Binding("ctrl+4", "focus_memory", "Memory"),
+        Binding("ctrl+5", "focus_vision", "Vision"),
+        Binding("ctrl+6", "focus_workflows", "Workflows"),
+        Binding("ctrl+7", "focus_tools", "Tools"),
         Binding("ctrl+l", "focus_main", "Main"),
-        Binding("ctrl+t", "focus_tools", "Tools"),
-        Binding("ctrl+m", "focus_memory", "Memory"),
-        Binding("ctrl+p", "focus_brain", "Brain"),
-        Binding("ctrl+v", "focus_vision", "Vision"),
-        Binding("ctrl+w", "focus_workflows", "Workflows"),
-        Binding("ctrl+g", "focus_system", "System"),
         Binding("ctrl+r", "record", "Record"),
-        Binding("ctrl+c", "cancel", "Cancel"),
         Binding("ctrl+q", "quit_app", "Quit"),
     ]
 
@@ -463,6 +492,8 @@ class JarvisConsole(App):
         self._session_lock = threading.Lock()
         self._vision: VisionStream | None = None
         self._vision_hint_shown = False
+        self._vision_active = False
+        self._pane_refreshing: set[str] = set()
         self._last_session = session_id
         self._last_latency: float | None = None
         self._last_role: str | None = None
@@ -480,6 +511,7 @@ class JarvisConsole(App):
 
     def _rail_ui(self, text: str, style: str = "dim") -> None:
         try:
+            text = _ANSI_RE.sub("", text)
             if style == "dim":
                 low = text.lower()
                 if any(k in low for k in ("error", "failed", "exception", "traceback", "cancelled")):
@@ -534,11 +566,6 @@ class JarvisConsole(App):
 
         # stdout sink → rail
         self.set_interval(0.4, self._sink_pump)
-        self.set_interval(3.0, self._refresh_system_pane)
-        self.set_interval(5.0, self._refresh_brain_pane)
-        self.set_interval(5.0, self._refresh_memory_pane)
-        self.set_interval(5.0, self._refresh_workflows_pane)
-        self.set_interval(10.0, self._refresh_tools_pane)
         self.set_interval(1.0, self._refresh_header)
 
         self._load_transcript()
@@ -555,6 +582,8 @@ class JarvisConsole(App):
             speak("Control console online.")
 
     def _sink_on_line(self, line: str) -> None:
+        if len(line) > 500:
+            line = line[:500] + "…"
         with self._rail_lock:
             self._sink_queue.append(line)
 
@@ -565,9 +594,10 @@ class JarvisConsole(App):
             pass
 
     def _flush_sink(self) -> None:
+        lines: list[str] = []
         with self._rail_lock:
-            lines = list(self._sink_queue)
-            self._sink_queue.clear()
+            while self._sink_queue and len(lines) < 60:
+                lines.append(self._sink_queue.popleft())
         for ln in lines:
             self._rail_ui(ln, "dim")
 
@@ -895,7 +925,7 @@ class JarvisConsole(App):
         self._vision = VisionStream(
             on_frame=self._vision_frame,
             on_status=self._vision_status,
-            active_check=lambda: True,
+            active_check=self._vision_pane_active,
         )
         self._vision.start()
         self._rail("Vision subsystem initialized.", "cyan")
@@ -944,6 +974,9 @@ class JarvisConsole(App):
         except Exception:
             pass
 
+    def _vision_pane_active(self) -> bool:
+        return self._vision_active
+
     def _return_focus(self) -> None:
         try:
             self.query_one(Composer).focus()
@@ -966,6 +999,47 @@ class JarvisConsole(App):
         self._return_focus()
 
     # ── panel refreshers ──────────────────────────────────
+    _PANE_TEXT_FN = {
+        "system": "_sys_info_text",
+        "brain": "_brain_text",
+        "memory": "_memory_text",
+        "workflows": "_workflows_text",
+        "tools": "_tools_text",
+    }
+
+    def _reveal_pane(self, pane_id: str) -> None:
+        """Refresh the newly-activated pane in a worker thread (never the UI)."""
+        key = pane_id[:-4] if pane_id.endswith("-tab") else pane_id
+        if key not in self._PANE_TEXT_FN or key in self._pane_refreshing:
+            return
+        self._pane_refreshing.add(key)
+        self._apply_pane_ui(key, "Refreshing…")
+        threading.Thread(target=self._pane_worker, args=(key,), daemon=True).start()
+
+    def _pane_worker(self, key: str) -> None:
+        try:
+            text = getattr(self, self._PANE_TEXT_FN[key])()
+        except Exception as e:  # noqa: BLE001
+            text = f"{key} data unavailable: {e}"
+        finally:
+            try:
+                self.call_from_thread(self._pane_done, key, text)
+            except RuntimeError:
+                pass
+
+    def _pane_done(self, key: str, text: str) -> None:
+        self._pane_refreshing.discard(key)
+        self._apply_pane_ui(key, text)
+
+    def _apply_pane_ui(self, key: str, text: str) -> None:
+        try:
+            tabs = self.query_one(TabbedContent)
+            if f"{key}-tab" not in (tabs.active or ""):
+                return
+            self.query_one(f"#{key}-pane").update(text)
+        except Exception:
+            pass
+
     def _sys_info_text(self) -> str:
         try:
             from tools.system_tools import disk_usage, get_system_info, get_top_processes
@@ -990,12 +1064,6 @@ class JarvisConsole(App):
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
             return f"System data unavailable: {e}"
-
-    def _refresh_system_pane(self) -> None:
-        try:
-            self.query_one("#system-pane").update(self._sys_info_text())
-        except Exception:
-            pass
 
     def _brain_text(self) -> str:
         try:
@@ -1028,12 +1096,6 @@ class JarvisConsole(App):
         except Exception as e:  # noqa: BLE001
             return f"Brain data unavailable: {e}"
 
-    def _refresh_brain_pane(self) -> None:
-        try:
-            self.query_one("#brain-pane").update(self._brain_text())
-        except Exception:
-            pass
-
     def _memory_text(self) -> str:
         try:
             from graph_memory import get_graph_summary
@@ -1058,12 +1120,6 @@ class JarvisConsole(App):
         except Exception as e:  # noqa: BLE001
             return f"Memory data unavailable: {e}"
 
-    def _refresh_memory_pane(self) -> None:
-        try:
-            self.query_one("#memory-pane").update(self._memory_text())
-        except Exception:
-            pass
-
     def _workflows_text(self) -> str:
         try:
             from workflow_engine import get_run_history, list_workflows
@@ -1080,12 +1136,6 @@ class JarvisConsole(App):
         except Exception as e:  # noqa: BLE001
             return f"Workflow data unavailable: {e}"
 
-    def _refresh_workflows_pane(self) -> None:
-        try:
-            self.query_one("#workflows-pane").update(self._workflows_text())
-        except Exception:
-            pass
-
     def _tools_text(self) -> str:
         try:
             from tools import TOOL_REGISTRY
@@ -1095,12 +1145,6 @@ class JarvisConsole(App):
             return f"{len(TOOL_REGISTRY)} tools loaded\n\n{caps}"
         except Exception as e:  # noqa: BLE001
             return f"Tool data unavailable: {e}"
-
-    def _refresh_tools_pane(self) -> None:
-        try:
-            self.query_one("#tools-pane").update(self._tools_text())
-        except Exception:
-            pass
 
     # ── compose ───────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -1130,12 +1174,13 @@ class JarvisConsole(App):
 
             with Vertical(id="rail-col"):
                 yield Static("ACTIVITY", classes="pane-label")
-                yield RichLog(id="activity", markup=True, highlight=True, wrap=True)
+                yield RichLog(id="activity", max_lines=800, wrap=False, highlight=False)
 
         yield Footer()
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         pane_id = event.pane.id or ""
+        self._vision_active = pane_id == "vision-tab"
         if pane_id == "vision-tab":
             self._ensure_vision(start_thread=_AUTOSTART_VISION)
             try:
@@ -1143,6 +1188,7 @@ class JarvisConsole(App):
             except Exception:
                 pass
             return
+        self._reveal_pane(pane_id)
         self._return_focus()
 
     @on(Button.Pressed, "#vision-toggle")
