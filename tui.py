@@ -1074,8 +1074,7 @@ class JarvisConsole(App):
             procs = get_top_processes(by="memory", count=5)
             if procs:
                 lines.append("")
-                lines.append("TOP PROCESSES (mem):")
-                for p in procs:
+                for p in procs.splitlines():
                     lines.append(f"  {p}")
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
