@@ -879,7 +879,10 @@ class JarvisConsole(App):
     def _focus_tab(self, pane_id: str) -> None:
         try:
             tabs = self.query_one(TabbedContent)
-            tabs.active = pane_id
+            # Must use the pane's real id ("system-tab"): the watcher posts
+            # TabActivated only if the tab lookup resolves, and the content
+            # switcher only switches with a matching pane id.
+            tabs.active = f"{pane_id}-tab"
             handler = {
                 "main": lambda: self.query_one(Composer).focus(),
                 "vision": self._ensure_vision,
@@ -978,7 +981,17 @@ class JarvisConsole(App):
         return self._vision_active
 
     def _return_focus(self) -> None:
+        """Pull focus back to the composer — but only when Main is active.
+
+        Focusing a widget inside a hidden pane makes Textual TabbedContent
+        auto-activate that pane (TabPane.Focused → active = that pane's id),
+        which yanks the user off SYSTEM/BRAIN/MEMORY/etc. right after the
+        pane refreshes.
+        """
         try:
+            tabs = self.query_one(TabbedContent)
+            if not (tabs.active or "").startswith("main"):
+                return
             self.query_one(Composer).focus()
         except Exception:
             pass
@@ -1034,7 +1047,10 @@ class JarvisConsole(App):
     def _apply_pane_ui(self, key: str, text: str) -> None:
         try:
             tabs = self.query_one(TabbedContent)
-            if f"{key}-tab" not in (tabs.active or ""):
+            active = tabs.active or ""
+            # Textual 8.2 reports the active tab sometimes as the key ("system")
+            # and sometimes as the pane id ("system-tab") — match either.
+            if key not in active and f"{key}-tab" not in active:
                 return
             self.query_one(f"#{key}-pane").update(text)
         except Exception:

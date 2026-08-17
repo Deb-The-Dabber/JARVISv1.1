@@ -87,6 +87,51 @@ def test_pane_apply_respects_active_tab():
     active[0] = "system-tab"
     app._apply_pane_ui("system", "data-while-open")
     assert writes == ["data-while-open"]
+    # Textual 8.2 may also report the active tab as the bare key ("system")
+    active[0] = "system"
+    app._apply_pane_ui("system", "data-key-form")
+    assert writes[-1] == "data-key-form"
+
+
+def test_pane_content_updates_after_tab_activation():
+    """Real TabbedContent: opening SYSTEM/BRAIN/MEMORY/WORKFLOWS/TOOLS must
+    replace the placeholder with computed content (regression: active-tab
+    id mismatch left panes stuck on 'Loading …')."""
+    import asyncio
+
+    from textual.widgets import Static, TabbedContent
+
+    app = JarvisConsole(session_id="default")
+    placeholders = {
+        "system": "Loading system…",
+        "brain": "Loading providers…",
+        "memory": "Loading memory…",
+        "workflows": "Loading workflows…",
+        "tools": "Loading tools…",
+    }
+
+    async def drive():
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            tabs = app.query_one(TabbedContent)
+            for num, key in (("ctrl+2", "system"), ("ctrl+3", "brain"), ("ctrl+4", "memory"),
+                             ("ctrl+6", "workflows"), ("ctrl+7", "tools")):
+                await pilot.press(num)
+                await pilot.pause(2.0)  # allow the off-thread refresh to land
+                pane = app.query_one(f"#{key}-pane", Static)
+                content = str(pane.render())
+                assert content != placeholders[key], f"{key} pane stuck on placeholder"
+                assert tabs.active == f"{key}-tab", (
+                    f"active must be the pane id form, got {tabs.active!r}"
+                )
+            # Mouse path: clicking the tab header must also refresh the pane.
+            await pilot.click("#--content-tab-system-tab")
+            await pilot.pause(2.0)
+            pane = app.query_one("#system-pane", Static)
+            assert str(pane.render()) != placeholders["system"], "click path stuck"
+            assert tabs.active == "system-tab", f"click active {tabs.active!r}"
+
+    asyncio.run(drive())
 
 
 def test_on_demand_refresh_hides_under_interval_churn():
