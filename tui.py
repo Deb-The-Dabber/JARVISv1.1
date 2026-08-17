@@ -33,6 +33,7 @@ from pathlib import Path
 
 from rich.text import Text
 from textual import on
+from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -128,12 +129,93 @@ class Composer(TextArea):
         Binding("ctrl+j", "newline", "Newline"),
         Binding("ctrl+up", "history_prev", "History"),
         Binding("ctrl+down", "history_next", "History"),
+        # Textual 8.2 binds super+c (copy) but NOT super+v — without this,
+        # cmd+v lands on the bare character "v". The OS bridge below also
+        # makes ctrl+v paste the real macOS clipboard (Textual's own
+        # clipboard is an internal string, not the OS one).
+        Binding("super+v", "paste_os", "Paste"),
     ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._history: list[str] = []
         self._hist_idx = -1
+
+    # ── OS clipboard bridge ──────────────────────────────
+    @staticmethod
+    def _os_clipboard_text() -> str:
+        try:
+            import pyperclip
+
+            text = pyperclip.paste() or ""
+            if text:
+                return text
+        except Exception:
+            pass
+        try:
+            import subprocess
+
+            proc = subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=3
+            )
+            return proc.stdout or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _os_clipboard_push(text: str) -> None:
+        try:
+            import pyperclip
+
+            pyperclip.copy(text)
+            return
+        except Exception:
+            pass
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["pbcopy"], input=text, text=True, timeout=3, check=False
+            )
+        except Exception:
+            pass
+
+    def action_paste(self) -> None:
+        """ctrl+v: paste the OS clipboard first, Textual's internal one as
+        a fallback (e.g. text copied inside the app without pyperclip)."""
+        if self.read_only:
+            return
+        text = self._os_clipboard_text() or self.app.clipboard or ""
+        if result := self._replace_via_keyboard(text, *self.selection):
+            self.move_cursor(result.end_location)
+
+    def action_paste_os(self) -> None:
+        """cmd+v when the terminal forwards it as a key (super+v)."""
+        if self.read_only:
+            return
+        text = self._os_clipboard_text()
+        if not text:
+            return
+        if result := self._replace_via_keyboard(text, *self.selection):
+            self.move_cursor(result.end_location)
+
+    def action_copy(self) -> None:
+        if not self.selected_text:
+            raise SkipAction()
+        text = self.selected_text
+        self.app.copy_to_clipboard(text)
+        self._os_clipboard_push(text)
+
+    def action_cut(self) -> None:
+        if self.read_only:
+            return
+        if not self.selected_text:
+            raise SkipAction()
+        text = self.selected_text
+        self.app.copy_to_clipboard(text)
+        self._os_clipboard_push(text)
+        if result := self._replace_via_keyboard("", *self.selection):
+            self.move_cursor(result.end_location)
 
     async def _on_key(self, event) -> None:
         if event.key == "enter":

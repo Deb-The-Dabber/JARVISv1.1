@@ -204,6 +204,66 @@ def test_system_monitor_modes_and_live_tick():
     asyncio.run(drive())
 
 
+def test_clipboard_bridge_pastes_os_clipboard():
+    """super+v and ctrl+v must insert the real OS clipboard (Textual's own
+    clipboard is an internal string; super+v is unbound upstream, which is
+    why cmd+v used to type a bare 'v'). Copies must also reach the OS."""
+    import asyncio
+
+    import pytest
+
+    try:
+        import pyperclip
+    except ImportError:
+        pytest.skip("pyperclip not installed")
+    try:
+        saved = pyperclip.paste()
+        pyperclip.copy("probe-on-clipboard")
+        assert pyperclip.paste() == "probe-on-clipboard"
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"no OS clipboard available: {e}")
+
+    from textual import events
+
+    from tui import Composer
+
+    app = JarvisConsole(session_id="default")
+
+    async def drive():
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            composer = app.query_one(Composer)
+            composer.focus()
+            await pilot.press("super+v")
+            await pilot.pause()
+            assert "probe-on-clipboard" in composer.text, "super+v must paste OS clipboard"
+            composer.text = ""
+            await pilot.press("ctrl+v")
+            await pilot.pause()
+            assert "probe-on-clipboard" in composer.text, "ctrl+v must paste OS clipboard"
+            # a real terminal paste (driver → app → focused widget) inserts once
+            composer.text = ""
+            app.post_message(events.Paste("paste-event-text"))
+            await pilot.pause()
+            assert composer.text == "paste-event-text", repr(composer.text)
+            # copy reaches the OS clipboard
+            composer.text = "select-me"
+            from textual.widgets.text_area import Selection
+
+            composer.selection = Selection((0, 0), (0, 6))
+            await pilot.press("super+c")
+            await pilot.pause()
+            assert pyperclip.paste() == "select", "super+c must push to OS clipboard"
+
+    try:
+        asyncio.run(drive())
+    finally:
+        try:
+            pyperclip.copy(saved)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def test_ctrl_c_cancels_when_composer_empty_but_copies_with_text():
     import asyncio
 
