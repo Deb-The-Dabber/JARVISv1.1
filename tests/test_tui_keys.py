@@ -135,7 +135,9 @@ def test_pane_content_updates_after_tab_activation():
 
 
 def test_on_demand_refresh_hides_under_interval_churn():
-    """The pane refreshers must not be wired to periodic intervals anymore."""
+    """Info panes must refresh on demand, NOT on periodic intervals — the
+    one deliberate exception is the SYSTEM pane's mini Activity Monitor
+    (_monitor_tick, live every 2s while its tab is open)."""
     import tui
 
     src = tui.__file__
@@ -144,6 +146,62 @@ def test_on_demand_refresh_hides_under_interval_churn():
     for stale in ("_refresh_system_pane", "_refresh_brain_pane", "_refresh_memory_pane",
                   "_refresh_workflows_pane", "_refresh_tools_pane"):
         assert stale not in text, f"stale interval refresher still present: {stale}"
+
+
+def test_system_monitor_modes_and_live_tick():
+    """SYSTEM pane is a mini Activity Monitor: c/m/d/n/e switch the metric
+    (only while the pane owns focus), and the live tick refreshes only
+    while the pane is open."""
+    import asyncio
+
+    from tui import SystemMonitor
+
+    app = JarvisConsole(session_id="default")
+
+    async def drive():
+        async with app.run_test(size=(140, 44)) as pilot:
+            await pilot.pause()
+            mon = app.query_one(SystemMonitor)
+            tabs = app.query_one(TabbedContent)
+
+            await pilot.press("ctrl+2")
+            await pilot.pause(0.2)
+            assert tabs.active == "system-tab"
+            assert mon.has_focus, "monitor must own focus so c/m/d/n/e switch modes"
+
+            # mode keys must land on the monitor, not the composer
+            await pilot.press("m")
+            assert mon.mode == "mem"
+            await pilot.press("c")
+            assert mon.mode == "cpu"
+            await pilot.press("d")
+            assert mon.mode == "disk"
+            await pilot.press("e")
+            assert mon.mode == "energy"
+            await pilot.press("n")
+            assert mon.mode == "net"
+
+            # a mode switch triggers an immediate refresh while open
+            for _ in range(100):
+                if not app._pane_refreshing:
+                    break
+                await pilot.pause(0.02)
+            app._monitor_tick()
+            assert "system" in app._pane_refreshing
+            for _ in range(100):
+                if "system" not in app._pane_refreshing:
+                    break
+                await pilot.pause(0.02)
+            text = str(mon.render())
+            assert "NET" in text and "pid" in text
+
+            # while on MAIN the tick must not touch the pane
+            await pilot.press("ctrl+1")
+            await pilot.pause(0.2)
+            app._monitor_tick()
+            assert app._pane_refreshing == set()
+
+    asyncio.run(drive())
 
 
 def test_ctrl_c_cancels_when_composer_empty_but_copies_with_text():

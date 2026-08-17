@@ -428,7 +428,162 @@ class VisionPane(Vertical):
 
 
 # ──────────────────────────────────────────────────────────
-# CONSOLE APP
+# MINI ACTIVITY MONITOR (SYSTEM pane)
+# ──────────────────────────────────────────────────────────
+class SystemMonitor(Static):
+    """Mini Activity Monitor: live per-process view.
+
+    c/m/d/n/e switches the metric like Activity Monitor's tabs. Refreshes
+    only while the SYSTEM pane is open (the app drives a 2s tick).
+    snapshot() runs on the worker thread — it owns all psutil state.
+    """
+
+    can_focus = True
+
+    class ModeChanged(Message):
+        """Posted when the user switches the metric (c/m/d/n/e)."""
+
+        def __init__(self, monitor: "SystemMonitor") -> None:
+            self.monitor = monitor
+            super().__init__()
+
+    MODE_LABELS = {
+        "cpu": "CPU",
+        "mem": "MEM",
+        "disk": "DISK",
+        "net": "NET",
+        "energy": "ENERGY",
+    }
+    MODE_HINTS = "c=cpu m=mem d=disk n=net e=energy"
+
+    BINDINGS = [
+        Binding("c", "mode_cpu", "CPU"),
+        Binding("m", "mode_mem", "Memory"),
+        Binding("d", "mode_disk", "Disk"),
+        Binding("n", "mode_net", "Network"),
+        Binding("e", "mode_energy", "Energy"),
+    ]
+
+    def __init__(self, *args, mode: str = "cpu", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.mode = mode
+        self._prev_at = 0.0
+        self._prev_net: tuple[float, float] | None = None
+        self._prev_disk: tuple[float, float] | None = None
+        self._energy: dict[int, float] = {}
+
+    def _set_mode(self, mode: str) -> None:
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self.post_message(self.ModeChanged(self))
+
+    def action_mode_cpu(self) -> None:
+        self._set_mode("cpu")
+
+    def action_mode_mem(self) -> None:
+        self._set_mode("mem")
+
+    def action_mode_disk(self) -> None:
+        self._set_mode("disk")
+
+    def action_mode_net(self) -> None:
+        self._set_mode("net")
+
+    def action_mode_energy(self) -> None:
+        self._set_mode("energy")
+
+    def snapshot(self) -> str:
+        """Build the pane text from the currently selected mode.
+
+        Runs on the worker thread; only this thread touches the psutil
+        delta state, so no locks are needed.
+        """
+        import psutil
+
+        now = time.monotonic()
+        dt = now - self._prev_at if self._prev_at else 2.0
+        self._prev_at = now
+        mode = self.mode
+
+        header = f"[b #89b4fa]▸ {self.MODE_LABELS[mode]}[/]  [dim]{self.MODE_HINTS}[/]"
+        try:
+            procs = [
+                p
+                for p in psutil.process_iter(["pid", "name", "memory_percent"])
+                if p.info.get("pid")
+            ]
+        except Exception:  # noqa: BLE001
+            return f"{header}\nprocess list unavailable"
+
+        si: dict = {}
+        try:
+            from tools.system_tools import get_system_info
+
+            si = get_system_info()
+        except Exception:  # noqa: BLE001
+            pass
+
+        lines = [header]
+        if mode == "cpu" and si.get("cpu_percent") is not None:
+            lines.append(f"CPU {si['cpu_percent']:.1f}%")
+        if mode == "mem" and si.get("memory_percent") is not None:
+            lines.append(f"RAM {si['memory_percent']:.1f}%")
+        if mode == "net":
+            try:
+                cur = psutil.net_io_counters()
+                ps, pr = self._prev_net or (cur.bytes_sent, cur.bytes_recv)
+                self._prev_net = (cur.bytes_sent, cur.bytes_recv)
+                up = max(cur.bytes_sent - ps, 0) / 1024 / max(dt, 0.1)
+                down = max(cur.bytes_recv - pr, 0) / 1024 / max(dt, 0.1)
+                lines.append(f"NET ↑ {up:6.0f} KB/s   ↓ {down:6.0f} KB/s  [dim](system-wide)[/]")
+            except Exception:  # noqa: BLE001
+                pass
+        elif mode == "disk":
+            try:
+                di = psutil.disk_io_counters()
+                if di:
+                    pr, pw = self._prev_disk or (di.read_bytes, di.write_bytes)
+                    self._prev_disk = (di.read_bytes, di.write_bytes)
+                    rd = max(di.read_bytes - pr, 0) / 1024 / max(dt, 0.1)
+                    wr = max(di.write_bytes - pw, 0) / 1024 / max(dt, 0.1)
+                    lines.append(f"DISK ↓ {rd:6.0f} KB/s  ↑ {wr:6.0f} KB/s  [dim](system-wide)[/]")
+            except Exception:  # noqa: BLE001
+                pass
+
+        rows: list[tuple[float, str]] = []
+        for proc in procs:
+            pid = proc.info["pid"]
+            name = (proc.info.get("name") or "?")[:24]
+            try:
+                cpu = proc.cpu_percent(None)
+                if mode in ("disk", "net"):
+                    # macOS psutil has no per-process disk/network counters;
+                    # show the busiest instead, with system-wide rates above.
+                    rows.append((cpu, f"{cpu:5.1f}%  {name}  (pid {pid})"))
+                    continue
+                mem = float(proc.info.get("memory_percent") or 0)
+                if mode == "cpu":
+                    rows.append((cpu, f"{cpu:5.1f}%  {name}  (pid {pid})"))
+                elif mode == "mem":
+                    rows.append((mem, f"{mem:5.1f}%  {name}  (pid {pid})"))
+                elif mode == "energy":
+                    prev = self._energy.get(pid, cpu)
+                    ema = 0.7 * prev + 0.3 * cpu
+                    self._energy[pid] = ema
+                    rows.append((ema, f"{ema:5.1f}%  {name}  (pid {pid})"))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        rows.sort(key=lambda item: item[0], reverse=True)
+        lines.append("")
+        if mode in ("disk", "net"):
+            lines.append("[dim]busiest by CPU:[/]")
+        for _, row in rows[:8]:
+            lines.append(row)
+        return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────────────────
 # CONSOLE APP
 # ──────────────────────────────────────────────────────────
@@ -460,6 +615,8 @@ class JarvisConsole(App):
     Static.pane-label { color: $text-muted; margin: 0 0 1 1; text-style: bold; }
     #main-col { min-width: 60; }
     #rail-col { width: 44; }
+    SystemMonitor { width: 1fr; padding: 0 1; }
+    SystemMonitor:focus { background: $panel; }
     TabbedContent Tab { padding: 0 1; }
     TabbedContent Tab.-active { color: $accent; text-style: bold; }
     """
@@ -567,6 +724,8 @@ class JarvisConsole(App):
         # stdout sink → rail
         self.set_interval(0.4, self._sink_pump)
         self.set_interval(1.0, self._refresh_header)
+        # mini Activity Monitor — only refreshes while the SYSTEM pane is open
+        self.set_interval(2.0, self._monitor_tick)
 
         self._load_transcript()
         self._refresh_header()
@@ -1013,7 +1172,7 @@ class JarvisConsole(App):
 
     # ── panel refreshers ──────────────────────────────────
     _PANE_TEXT_FN = {
-        "system": "_sys_info_text",
+        "system": "_monitor_text",
         "brain": "_brain_text",
         "memory": "_memory_text",
         "workflows": "_workflows_text",
@@ -1056,29 +1215,21 @@ class JarvisConsole(App):
         except Exception:
             pass
 
-    def _sys_info_text(self) -> str:
+    def _monitor_tick(self) -> None:
+        """Live refresh driver: only while the SYSTEM pane is open."""
         try:
-            from tools.system_tools import disk_usage, get_system_info, get_top_processes
+            tabs = self.query_one(TabbedContent)
+            if not (tabs.active or "").startswith("system"):
+                return
+            self._reveal_pane("system")
+        except Exception:
+            pass
 
-            si = get_system_info()
-            du = disk_usage()
-            lines = []
-            cpu = si.get("cpu_percent")
-            mem = si.get("memory_percent")
-            if cpu is not None:
-                lines.append(f"CPU: {cpu}")
-            if mem is not None:
-                lines.append(f"RAM: {mem}")
-            if isinstance(du, dict):
-                lines.append(f"Disk: {du.get('percent', '?')} used ({du.get('free_gb', '?')} GB free)")
-            procs = get_top_processes(by="memory", count=5)
-            if procs:
-                lines.append("")
-                for p in procs.splitlines():
-                    lines.append(f"  {p}")
-            return "\n".join(lines)
-        except Exception as e:  # noqa: BLE001
-            return f"System data unavailable: {e}"
+    def _monitor_text(self) -> str:
+        return self.query_one(SystemMonitor).snapshot()
+
+    def on_system_monitor_mode_changed(self, event: SystemMonitor.ModeChanged) -> None:
+        self._reveal_pane("system")
 
     def _brain_text(self) -> str:
         try:
@@ -1175,7 +1326,7 @@ class JarvisConsole(App):
                             yield Static("", id="status-strip")
                             yield Composer(placeholder="Type a message or task… Enter to send, ctrl+enter newline")
                     with TabPane("SYSTEM", id="system-tab"):
-                        yield Static("Loading system…", id="system-pane")
+                        yield SystemMonitor("Loading system…", id="system-pane")
                     with TabPane("BRAIN", id="brain-tab"):
                         yield Static("Loading providers…", id="brain-pane")
                     with TabPane("MEMORY", id="memory-tab"):
@@ -1204,6 +1355,13 @@ class JarvisConsole(App):
                 pass
             return
         self._reveal_pane(pane_id)
+        if pane_id == "system-tab":
+            # keep keys on the monitor so c/m/d/n/e switch the metric
+            try:
+                self.query_one(SystemMonitor).focus()
+            except Exception:
+                pass
+            return
         self._return_focus()
 
     @on(Button.Pressed, "#vision-toggle")
