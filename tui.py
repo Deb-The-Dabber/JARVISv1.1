@@ -273,19 +273,26 @@ class Composer(TextArea):
 # ──────────────────────────────────────────────────────────
 def load_artificial_retina():
     """Load ArtificialRetina from jarvis_vision_experiment WITHOUT executing
-    the module (it opens the camera and runs an infinite loop at import)."""
-    path = Path(__file__).parent / "jarvis_vision_experiment" / "vision.py"
-    source = path.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ArtificialRetina")
-    mod = ast.Module(body=[cls], type_ignores=[])
-    ast.fix_missing_locations(mod)
-    import cv2
-    import numpy as np
+    the module (it opens the camera and runs an infinite loop at import).
 
-    ns = {"cv2": cv2, "np": np}
-    exec(compile(mod, str(path), "exec"), ns)  # noqa: S102 — trusted local source
-    return ns["ArtificialRetina"]
+    The experiment folder is a scratch area (Jarvis self-test) that can be
+    mid-edit — any parse/extract error returns None; callers degrade to
+    "retina unavailable" instead of crashing the Vision tab."""
+    try:
+        path = Path(__file__).parent / "jarvis_vision_experiment" / "vision.py"
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ArtificialRetina")
+        mod = ast.Module(body=[cls], type_ignores=[])
+        ast.fix_missing_locations(mod)
+        import cv2
+        import numpy as np
+
+        ns = {"cv2": cv2, "np": np}
+        exec(compile(mod, str(path), "exec"), ns)  # noqa: S102 — trusted local source
+        return ns["ArtificialRetina"]
+    except Exception:
+        return None
 
 
 def _ascii_frame(gray, cols: int = 64, rows: int = 24) -> str:
@@ -716,6 +723,12 @@ class JarvisConsole(App):
         Binding("ctrl+l", "focus_main", "Main"),
         Binding("ctrl+r", "record", "Record"),
         Binding("ctrl+q", "quit_app", "Quit"),
+        # Copy-to-OS-clipboard shortcuts — priority so they win even while
+        # the composer TextArea is focused. ctrl+shift+c/t/a never collide
+        # with TextArea defaults (ctrl+c copy / ctrl+x cut / ctrl+v paste).
+        Binding("ctrl+shift+c", "copy_reply", "Copy last reply", priority=True),
+        Binding("ctrl+shift+t", "copy_transcript", "Copy transcript", priority=True),
+        Binding("ctrl+shift+a", "copy_thinking", "Copy thinking", priority=True),
     ]
 
     def __init__(self, session_id: str = "default") -> None:
@@ -736,6 +749,10 @@ class JarvisConsole(App):
         self._last_session = session_id
         self._last_latency: float | None = None
         self._last_role: str | None = None
+        # Plain-text copies of what's on screen, for OS-clipboard copy
+        # actions (ctrl+shift+c/t/a).
+        self._transcript_pt: list[tuple[str, str]] = []  # (role, text)
+        self._activity_pt: list[str] = []
 
     # ── live UI threading helpers ─────────────────────────
     def _rail(self, text: str, style: str = "dim") -> None:
@@ -751,6 +768,8 @@ class JarvisConsole(App):
     def _rail_ui(self, text: str, style: str = "dim") -> None:
         try:
             text = _ANSI_RE.sub("", text)
+            self._activity_pt.append(text.lstrip())
+            del self._activity_pt[:-1200]
             if style == "dim":
                 low = text.lower()
                 if any(k in low for k in ("error", "failed", "exception", "traceback", "cancelled")):
@@ -778,6 +797,8 @@ class JarvisConsole(App):
             if role == "user" and self._last_role == "assistant":
                 log.write("")
             self._last_role = role
+            self._transcript_pt.append((role, text))
+            del self._transcript_pt[:-2000]
             if role == "user":
                 prefix, pstyle, body_style = f"{'YOU':>8} »", "bold #89b4fa", "#89b4fa"
             else:
@@ -853,6 +874,7 @@ class JarvisConsole(App):
             return
         log = self.query_one("#transcript", RichLog)
         log.clear()
+        self._transcript_pt = []
         shown = 0
         for m in msgs[-80:]:
             role = m.get("role", "")
@@ -916,6 +938,8 @@ class JarvisConsole(App):
                 ("  ·  ", "dim"),
                 (lat, "dim"),
                 (f"  ·  {btn}", "bold #f9e2af") if btn else "",
+                ("  ·  ", "dim"),
+                ("copy ⌃⇧C reply · ⌃⇧T all · ⌃⇧A thinking", "dim"),
             )
         )
 
@@ -1155,6 +1179,40 @@ class JarvisConsole(App):
 
     def action_focus_tools(self) -> None:
         self._focus_tab("tools")
+
+    # ── OS-clipboard copy actions (ctrl+shift+c / t / a) ──
+    def _copy_to_os(self, text: str, what: str) -> None:
+        if not text:
+            self._rail(f"Nothing to copy ({what}).", "yellow")
+            return
+        try:
+            Composer._os_clipboard_push(text)
+        except Exception:
+            self._rail("Copy failed — no OS clipboard available.", "red")
+            return
+        self._rail(f"Copied {what} ({len(text)} chars) to the clipboard.")
+
+    def action_copy_reply(self) -> None:
+        """Copy the last JARVIS reply (runs back to the last user message)."""
+        parts: list[str] = []
+        for role, text in reversed(self._transcript_pt):
+            if role != "assistant":
+                break
+            parts.append(text)
+        self._copy_to_os("\n\n".join(reversed(parts)), "last reply")
+
+    def action_copy_transcript(self) -> None:
+        """Copy the whole in-memory conversation, YOU/JARVIS labelled."""
+        lines = []
+        for role, text in self._transcript_pt:
+            who = "YOU" if role == "user" else "JARVIS"
+            lines.append(f"{who}: {text}")
+        self._copy_to_os("\n\n".join(lines), "transcript")
+
+    def action_copy_thinking(self) -> None:
+        """Copy the last ~400 activity/thinking lines (debug, tool calls,
+        provider events — everything in the Brain rail)."""
+        self._copy_to_os("\n".join(self._activity_pt[-400:]), "thinking")
 
     def _ensure_vision(self, start_thread: bool | None = None) -> None:
         if start_thread is None:

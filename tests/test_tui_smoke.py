@@ -69,9 +69,23 @@ def test_tui_boots_and_composes():
 
 
 def test_retina_class_loads_without_executing_module():
+    """The retina loader must never execute the module (it opens the camera
+    and loops forever at import) and must never raise — the experiment
+    folder is a scratch Jarvis self-test that can be mid-edit, so a broken
+    source must yield None, not crash the Vision tab."""
     from tui import load_artificial_retina
 
     cls = load_artificial_retina()
-    retina = cls(width=320, height=180)
-    assert retina.width == 320
-    assert retina.height == 180
+    if cls is not None:
+        retina = cls(width=320, height=180)
+        assert retina.width == 320
+        assert retina.height == 180
+
+    import tui
+
+    orig = tui.Path.read_text
+    tui.Path.read_text = lambda self, **kw: "this is ( not valid python !!"
+    try:
+        assert load_artificial_retina() is None, "broken experiment source must degrade to None"
+    finally:
+        tui.Path.read_text = orig

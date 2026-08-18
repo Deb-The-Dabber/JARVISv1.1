@@ -292,3 +292,71 @@ def test_ctrl_c_cancels_when_composer_empty_but_copies_with_text():
             app._cancel = False
 
     asyncio.run(drive())
+
+
+def test_copy_actions_push_reply_transcript_thinking_to_os_clipboard():
+    """ctrl+shift+c/t/a must copy Jarvis's reply / the transcript / the
+    thinking rail to the real OS clipboard (for pasting into other tools),
+    even while the composer TextArea is focused."""
+    import asyncio
+
+    import pytest
+
+    try:
+        import pyperclip
+    except ImportError:
+        pytest.skip("pyperclip not installed")
+    try:
+        saved = pyperclip.paste()
+        pyperclip.copy("probe-on-clipboard")
+        assert pyperclip.paste() == "probe-on-clipboard"
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"no OS clipboard available: {e}")
+
+    from tui import JarvisConsole
+
+    app = JarvisConsole(session_id="default")
+
+    async def drive():
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            composer = app.query_one(Composer)
+            composer.focus()  # keys must win over the focused TextArea
+
+            # feed a conversation + thinking lines through the real render paths
+            app._transcript_line_ui("user", "what is 2+2?")
+            app._transcript_line_ui("assistant", "four, obviously.")
+            app._transcript_line_ui("user", "and 3*3?")
+            app._transcript_line_ui("assistant", "nine.")
+            app._rail_ui("[Intent] classified as chat", "dim")
+            app._rail_ui("tool_execute_start read_file", "dim")
+
+            await pilot.press("ctrl+shift+c")
+            await pilot.pause()
+            assert pyperclip.paste() == "nine.", "copy reply = last assistant run only"
+
+            await pilot.press("ctrl+shift+t")
+            await pilot.pause()
+            assert "what is 2+2?" in pyperclip.paste()
+            assert "JARVIS: nine." in pyperclip.paste()
+
+            await pilot.press("ctrl+shift+a")
+            await pilot.pause()
+            thinking = pyperclip.paste()
+            assert "[Intent] classified as chat" in thinking
+            assert "tool_execute_start read_file" in thinking
+
+    try:
+        asyncio.run(drive())
+    finally:
+        try:
+            pyperclip.copy(saved)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_copy_action_keys_do_not_collide_with_composer():
+    """The copy shortcuts use ctrl+shift chords — TextArea owns ctrl+c/x/v."""
+    console_keys = {k for b in JarvisConsole.BINDINGS for k in b.key.split(",")}
+    assert {"ctrl+shift+c", "ctrl+shift+t", "ctrl+shift+a"} <= console_keys
+    assert not console_keys & _TEXTAREA_KEYS
