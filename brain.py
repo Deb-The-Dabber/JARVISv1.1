@@ -753,42 +753,42 @@ TOOL_USE_KEYWORDS = {
     "ip",
 }
 
+# Only high-precision CAD tokens live here. Generic engineering words
+# (feature, depth, dimension, part, body, sketch, hole, ...) were removed
+# because they crashed into everyday language ("visual feature extraction",
+# "flatten a nested list of arbitrary depth") and misrouted chat/coding
+# requests into the Onshape handler. Strong tokens trigger alone; the rest
+# (extrude/fillet/chamfer) only count alongside a second signal, see
+# _cad_triggered().
 CAD_KEYWORDS = {
     "onshape",
     "cad",
     "part studio",
     "partstudio",
-    "feature",
-    "features",
     "extrude",
     "fillet",
     "chamfer",
-    "hole",
-    "sketch",
-    "plane",
-    "assembly",
-    "assembly",
-    "drawing",
-    "document",
-    "workspace",
-    "element",
-    "dimension",
-    "parameter",
-    "sketch",
-    "constraint",
-    "mate",
-    "part",
-    "body",
-    "mass",
-    "volume",
-    "diameter",
-    "radius",
-    "depth",
-    "thickness",
-    "height",
-    "width",
-    "length",
 }
+
+CAD_STRONG_WORDS = ("onshape", "part studio", "partstudio", "cad")
+
+
+def _cad_triggered(t: str) -> bool:
+    """True only for unambiguous CAD/Onshape signals.
+
+    Any Onshape URL counts. Otherwise a single strong token (onshape, cad,
+    part studio) is enough — they have no everyday meaning. The weaker CAD
+    verbs (extrude/fillet/chamfer) need a second distinct keyword so a lone
+    "salmon fillet" or "fillet of cod" doesn't land in the Onshape handler.
+    """
+    if "cad.onshape.com" in t or "/documents/" in t:
+        return True
+    import re
+    hits = re.findall(r"\b(" + "|".join(re.escape(k) for k in CAD_KEYWORDS) + r")\b", t)
+    distinct = set(hits)
+    if any(w in distinct for w in CAD_STRONG_WORDS):
+        return True
+    return len(distinct) >= 2
 
 
 def _local_intent_predict(text: str) -> tuple[str | None, float]:
@@ -908,15 +908,6 @@ def classify_intent(text: str) -> str:
             _log_classifier_path("keyword", "self_mod")
             return "self_mod"
 
-    # CAD / Onshape — keyword-first detection before LLM (like self_mod)
-    # Use word boundaries to avoid false positives like "documentation" containing "document"
-    import re
-    cad_pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in CAD_KEYWORDS) + r")\b")
-    if cad_pattern.search(t) or "cad.onshape.com" in t or "/documents/" in t:
-        _debug(f"[Intent] classify_intent('{text}'): 'cad' — CAD keyword/URL")
-        _log_classifier_path("keyword", "cad")
-        return "cad"
-
     # Memory triggers — handled directly in process(), not via tools
     memory_triggers = (
         "remember that",
@@ -945,6 +936,14 @@ def classify_intent(text: str) -> str:
         _debug(f"[Intent] classify_intent('{text}'): 'chat' — knowledge query")
         _log_classifier_path("knowledge", "chat")
         return "chat"
+
+    # CAD / Onshape — keyword-first detection before LLM (like self_mod).
+    # Only unambiguous signals (see _cad_triggered): strong tokens/URLs alone,
+    # weaker CAD verbs only with a second CAD keyword.
+    if _cad_triggered(t):
+        _debug(f"[Intent] classify_intent('{text}'): 'cad' — CAD keyword/URL")
+        _log_classifier_path("keyword", "cad")
+        return "cad"
 
     # Check intent cache (per-turn)
     if text in conversation_context.intent_cache:
@@ -1050,14 +1049,6 @@ def classify_intent(text: str) -> str:
                         return classification
             except Exception as e:
                 _debug(f"[Intent] LLM classification error: {e}")
-
-    # CAD / Onshape — early detection before keyword fallback
-    import re
-    cad_pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in CAD_KEYWORDS) + r")\b")
-    if cad_pattern.search(t) or "cad.onshape.com" in t:
-        _debug(f"[Intent] classify_intent('{text}'): 'cad' — CAD keyword/URL")
-        _log_classifier_path("keyword", "cad")
-        return "cad"
 
     # Keyword fallback for remaining cases
 
@@ -3902,7 +3893,10 @@ def _handle_cad_request(user_message: str) -> str:
                     lines.append(f"  • {w.get('name')}  (id: {w.get('id')[:8]}...)")
             return "\n".join(lines)
 
-    # Fallback: generic help
+    # Fallback: nothing actionable in the message (no document URL/IDs).
+    # Return None so ask_with_tools falls through to the normal provider
+    # chain instead of dead-ending in canned Onshape help for messages that
+    # merely happen to route as 'cad'.
     if did and wid and eid:
         return (
             f"Found Part Studio (did={did[:8]}, wid={wid[:8]}, eid={eid[:8]}). "
@@ -3914,12 +3908,8 @@ def _handle_cad_request(user_message: str) -> str:
             "Try: 'list elements', 'show workspaces', or paste a full Part Studio URL."
         )
     else:
-        return (
-            "I can help with Onshape! Try:\n"
-            "  • 'list my onshape documents'\n"
-            "  • Paste a document URL: https://cad.onshape.com/documents/.../w/.../e/...\n"
-            "  • Then: 'list features', 'what's the diameter of Hole 1', 'list parts'"
-        )
+        _debug("[CAD] No document URL/IDs in message — falling through to provider chain")
+        return None
 
 
 def ask_with_tools(user_message: str) -> str:
@@ -3957,13 +3947,16 @@ def _ask_with_tools_impl(user_message: str) -> str:
 
     # ── CAD / Onshape intent (read-only Phase 1) ──
     if intent == "cad":
-        log_decision(
-            phase="act",
-            decision="cad_handler",
-            decision_source="intent_equals_cad",
-            measurable_inputs={"intent": intent},
-        )
-        return _handle_cad_request(user_message)
+        cad_reply = _handle_cad_request(user_message)
+        if cad_reply is not None:
+            log_decision(
+                phase="act",
+                decision="cad_handler",
+                decision_source="intent_equals_cad",
+                measurable_inputs={"intent": intent},
+            )
+            return cad_reply
+        # Nothing actionable (no URL/IDs) — fall through to the normal flow.
 
     if not _internet_available():
         log_decision(

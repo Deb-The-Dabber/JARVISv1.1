@@ -137,3 +137,53 @@ class TestKeywordSets:
         assert "weather" in TOOL_USE_KEYWORDS
         assert "browse" in TOOL_USE_KEYWORDS
         assert "click" in TOOL_USE_KEYWORDS
+
+
+class TestCad:
+    # CAD routing is keyword-first (like self_mod) but only for unambiguous
+    # signals — generic engineering words must NOT route to 'cad'.
+
+    def test_generic_feature_extraction_not_cad(self):
+        # Regression: "as part of JARVIS, visual feature extraction" matched
+        # 'feature' and misrouted a folder-exploration mission into Onshape.
+        assert (
+            classify_intent(
+                "explore the folder jarvis_vision_experiment as part of JARVIS, visual feature extraction"
+            )
+            == "chat"
+        )
+
+    def test_arbitrary_depth_not_cad(self):
+        # Regression (bench case before_2b_08): 'depth' used to misroute
+        # "flatten a nested list of arbitrary depth" into Onshape.
+        assert classify_intent("flatten a nested list of arbitrary depth") != "cad"
+
+    def test_lone_fillet_not_cad(self):
+        # 'fillet' is CAD vocabulary but also everyday cooking language.
+        assert classify_intent("cook a salmon fillet for dinner") == "chat"
+
+    def test_pool_depth_not_cad(self):
+        assert classify_intent("measure the depth of the pool") != "cad"
+
+    def test_memory_precedes_cad(self):
+        # "part studio" would hit CAD keywords — memory trigger must win.
+        assert classify_intent("remember that my part studio is cool") == "chat"
+
+    def test_knowledge_precedes_cad(self):
+        assert classify_intent("what do you know about my part studio") == "chat"
+
+    def test_onshape_word_routes_cad(self):
+        assert classify_intent("list my onshape documents") == "cad"
+
+    def test_cad_url_routes_cad(self):
+        url = "https://cad.onshape.com/documents/abc123/w/def456/e/ghi789"
+        assert classify_intent(f"what features are in {url}") == "cad"
+
+    def test_two_cad_verbs_route_cad(self):
+        # Weaker CAD verbs need a second distinct CAD keyword.
+        assert classify_intent("extrude and fillet the bracket") == "cad"
+
+    def test_two_cad_verbs_need_no_second(self):
+        # A single weak verb ('fillet' alone) is not enough — covered above;
+        # here verify the pair 'extrude chamfer' also routes.
+        assert classify_intent("add a chamfer and extrude it") == "cad"
