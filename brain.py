@@ -143,8 +143,10 @@ NIM_MODEL_FRONTIER = [
 # prove reliable (<10s) latency first (2026-08-13 probe: 21.7s for 1 token).
 NIM_MODEL_REASONING = ["nvidia/nemotron-3-super-120b-a12b"]
 GROQ_MODEL = "llama-3.3-70b-versatile"
-# OpenRouter free tier: use a known working free model
-OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+# OpenRouter: the ':free' slug for llama-3.1-8b was pulled (404 "unavailable
+# for free" — provider suggests the plain, paid-but-cheap slug). Override in
+# .env via OPENROUTER_MODEL.
+OPENROUTER_MODEL = _env("OPENROUTER_MODEL") or "meta-llama/llama-3.1-8b-instruct"
 POLLINATIONS_MODEL = "openai"
 NEMOTRON_ULTRA_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 
@@ -155,6 +157,10 @@ DEBUG = os.getenv("JARVIS_DEBUG", "0").lower() in ("1", "true", "yes", "on")
 GEMINI_MAX_TOOL_ROUNDS = 8
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_TIMEOUT = 600
+# Hard time budget per provider slot in a tool-calling loop. Without it a
+# single stalled model can burn minutes of API calls across the fallback
+# chain (observed: NIM Fast 113s + NIM Coding 52s on one request).
+PROVIDER_SLOT_TIME_BUDGET = 60
 
 # ----- LLM‑first helper utilities -----
 
@@ -457,6 +463,12 @@ def _classify_error(error_text: str) -> str | None:
         return "internal"
     if "overloaded" in err or "internal server error" in err or "server error" in err:
         return "internal"
+    if "did not resolve" in err or "malformed tool call" in err:
+        # Quality failure, not an outage: the model spent its tool rounds and
+        # never produced a final answer (or emitted garbage tool names).
+        # Must NOT trip the circuit breaker — one bad request shouldn't take
+        # down the whole provider chain.
+        return "resolution"
     return "unknown"
 
 def _handle_provider_failure(provider_name: str, exc: Exception) -> None:
@@ -464,6 +476,14 @@ def _handle_provider_failure(provider_name: str, exc: Exception) -> None:
     Calls ``_record_provider_failure`` and ``_backoff_provider`` with a duration based on the error type.
     """
     label = _classify_error(str(exc))
+    if label == "resolution":
+        # Quality failure (tool loop never resolved) — record the health dip
+        # but do NOT touch the circuit breaker: _backoff_provider(name, 0)
+        # would still clamp the circuit open for 300s, and one bad request
+        # cascading the whole fallback chain is exactly the incident this
+        # classification exists to prevent.
+        _record_provider_failure(provider_name)
+        return
     if label == "rate_limit":
         backoff_secs = 1800
     elif label == "auth_error":
@@ -1516,7 +1536,7 @@ def check_providers() -> dict:
         "nemotron_ultra": "NVIDIA Nemotron Ultra (primary, tool-first + final)",
         "gemini": "Gemini 2.5 Flash (fallback, tool calling)",
         "groq": "Groq llama-3.3-70b (fallback)",
-        "openrouter": "OpenRouter deepseek-r1 (fallback)",
+        "openrouter": "OpenRouter llama-3.1-8b (last-resort)",
         "nvidia_nim": "NVIDIA NIM (fallback tiers)",
         "pollinations": "Pollinations.ai (no-key emergency)",
         "huggingface": "HuggingFace (embeddings/downloads)",
@@ -2058,8 +2078,13 @@ def _ask_nemotron_ultra_model(
         messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_str})
 
     _nemotron_loop_count = 0
+    slot_deadline = time.monotonic() + PROVIDER_SLOT_TIME_BUDGET
     for _ in range(4):
         _nemotron_loop_count += 1
+        if time.monotonic() > slot_deadline:
+            raise Exception(
+                "Nemotron Ultra tool execution did not resolve (time budget exceeded)"
+            )
         _debug(f"[Nemotron Ultra] Loop iter {_nemotron_loop_count}/4")
         # Phase 0.5: Force synthesis on last iteration to prevent tool-call-only loop
         is_last_iter = _nemotron_loop_count >= 4
@@ -2345,8 +2370,21 @@ def _print_file_change(path: str, diff: str, ins: int, dels: int):
     print("========== Say YES to apply, or NO to discard ==========\n")
 
 
+def _is_malformed_tool_name(fn_name: str) -> bool:
+    """NIM reasoning models occasionally leak CoT channel markers into tool
+    names (observed: 'read_file<|channel|>commentary'). Such calls can never
+    resolve — fail fast so the provider slot hands off quickly instead of
+    burning another tool round (~20-30s) on a garbage name."""
+    return bool(fn_name) and any(ch in fn_name for ch in ("<", ">", "|"))
+
+
 def _execute_tool(fn_name: str, fn_args: dict) -> str:
     tool_start = time.time()
+    if _is_malformed_tool_name(fn_name):
+        # Classifies as 'resolution' upstream: health dip, no circuit trip.
+        raise Exception(
+            f"tool execution did not resolve (malformed tool call '{fn_name}')"
+        )
     # Track tool names for eval harness / audit
     _tool_call_names.append(fn_name)
     # Per-turn memoization — same tool+args within one user message
@@ -3075,7 +3113,13 @@ def _ask_openai_compatible(
     use_modern_format = provider_name in _TOOLS_FORMAT_PROVIDERS
     enable_tools = not tool_results
 
+    # Hard deadline for the whole slot: a stalled model must hand off to the
+    # fallback chain instead of eating minutes of API calls (observed 113s on
+    # NIM Fast for a single request).
+    slot_deadline = time.monotonic() + PROVIDER_SLOT_TIME_BUDGET
     for _ in range(4):  # up from 2 — allows tool call + result + follow-up
+        if time.monotonic() > slot_deadline:
+            raise Exception(f"{provider_name} tool execution did not resolve (time budget exceeded)")
         kwargs = {
             "model": model,
             "messages": messages,

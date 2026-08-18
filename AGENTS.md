@@ -134,8 +134,10 @@ User → Intent Router → Nemotron Ultra (primary) → Fallbacks
 | 4 | **NIM Fast** | super-49b-v1.5 → nano-30b → step-3.7-flash (low-effort/chat fast path) |
 | 5 | **NIM Coding** | minimax-m3 → gpt-oss-20b → deepseek-v4-flash (coding/agentic) |
 | 6 | **NIM Frontier** (scoring slot) | ultra → minimax-m3 understudy; the probe/low-effort chain's frontier entry |
-| 7 | **OpenRouter deepseek-r1** | Last-resort fallback |
-| 8 | **Pollinations.ai** | No-key emergency fallback |
+| 7 | **OpenRouter llama-3.1-8b** | Last-resort fallback (`OPENROUTER_MODEL` overridable; the old `deepseek-r1` and `:free` slugs 404 — provider pulled them) |
+| 8 | **Pollinations.ai** | No-key emergency fallback (returned 402 Payment Required 2026-08-17 — effectively retired until it serves 200) |
+
+Tool-loop quality failures ("tool execution did not resolve") are classified `resolution` — they record a health dip but NEVER trip the circuit breaker/backoff, so one stalled request no longer takes down the whole chain. Malformed tool names (NIM leaking CoT channel markers like `read_file<|channel|>commentary`) fail fast in `_execute_tool`, and each provider slot gets a hard `PROVIDER_SLOT_TIME_BUDGET` (60s, `brain.py`) — without it a single request burned 113s on NIM Fast + 52s on NIM Coding + 404 + 402 before Gemini answered (3.3min total).
 
 NIM slots replace the legacy Tier 5/6 lists (Llama 4 Maverick, MiniMax M2.7, Qwen 3.5, Mistral Large 3 — all removed from the build.nvidia.com catalog). `NIM_MODEL_REASONING` (nemotron-3-super-120b-a12b) is **defined but not registered** — the E4 probe (`scripts/nim_probe.py`, `~/.jarvis/nim_probe.jsonl`) gates its activation (<10s median). Vision still uses `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` (working endpoint). Nano-Omni (`nemotron-3-nano-omni-30b-a3b-reasoning`) is the designated replacement — 400/Function-gate with both keys on 2026-08-13; the E4 probe (`scripts/nim_probe.py`) tracks its recovery and the swap flips when it serves 200. All slots are free endpoints under one `NVIDIA_NEMOTRON_API_KEY`.
 
