@@ -83,10 +83,10 @@ jobs:
             --host 127.0.0.1 --port 18889 --log-level warning &
           sleep 3
           curl -f http://127.0.0.1:18889/health
-      - name: Run regression tests (mock mode)
+      - name: Run regression gate (mock mode)
         env:
           DISPLAY: ":99"
-        run: pytest tests/regression/ -m "regression and not local" -v --tb=short
+        run: python benchmarks/regression_gate.py --mode mock --only golden --only gates --no-api
       - name: Run fallback tests
         env:
           DISPLAY: ":99"

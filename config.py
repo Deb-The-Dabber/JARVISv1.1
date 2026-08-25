@@ -117,7 +117,7 @@ MODEL_CONTEXT_LIMITS = {
     "gemini-3.5-flash": 32768,
     "gemini-2.5-flash": 32768,
     "deepseek-ai/deepseek-v4-flash": 32768,
-    "llama-3.3-70b-versatile": 32768,
+    "groq/compound-mini": 131072,
     "meta-llama/llama-3.3-70b-instruct:free": 32768,
     "openai": 32768,
 }

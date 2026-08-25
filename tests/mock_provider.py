@@ -362,6 +362,8 @@ async def chat_completions(request: Request):
             raise HTTPException(500, "Internal Server Error")
         if fail_mode == "429":
             raise HTTPException(429, {"error": {"message": "Rate limit", "type": "rate_limit_error"}, "retry_after": 60})
+        if fail_mode == "402":
+            raise HTTPException(402, "Payment Required: insufficient credits")
         if fail_mode:
             raise HTTPException(503, f"Service unavailable ({fail_mode})")
 
@@ -412,37 +414,43 @@ async def gemini_generate(model: str, request: Request):
     _check_rate_limit(provider)
     fail_mode = _is_failing(provider)
 
-    if fail_mode == "timeout":
-        time.sleep(120)
-        raise HTTPException(504, "Gateway Timeout")
-    if fail_mode == "500":
-        raise HTTPException(500, "Internal Server Error")
-    if fail_mode:
-        raise HTTPException(503, f"Service unavailable ({fail_mode})")
+    try:
+        if fail_mode == "timeout":
+            time.sleep(120)
+            raise HTTPException(504, "Gateway Timeout")
+        if fail_mode == "500":
+            raise HTTPException(500, "Internal Server Error")
+        if fail_mode == "402":
+            raise HTTPException(402, "Payment Required: insufficient credits")
+        if fail_mode:
+            raise HTTPException(503, f"Service unavailable ({fail_mode})")
 
-    _apply_latency(provider)
+        _apply_latency(provider)
 
-    user_msg = _last_user_message(messages)
-    has_tool_results = any(m.get("role") == "function" for m in messages)
+        user_msg = _last_user_message(messages)
+        has_tool_results = any(m.get("role") == "function" for m in messages)
 
-    if has_tool_results:
-        _record_call(provider, True)
-        return _gemini_text_response(model, f"Mock result for: {user_msg}")
-
-    # Check for function declarations from tools config
-    declarations = []
-    for t in tools_config:
-        for fd in t.get("function_declarations", []):
-            declarations.append(fd)
-
-    if declarations:
-        chosen = _pick_tool(user_msg, declarations)
-        if chosen:
+        if has_tool_results:
             _record_call(provider, True)
-            return _gemini_tool_response(model, chosen["name"], json.loads(chosen["arguments"]))
+            return _gemini_text_response(model, f"Mock result for: {user_msg}")
 
-    _record_call(provider, True)
-    return _gemini_text_response(model, f"Mock response for: {user_msg}")
+        # Check for function declarations from tools config
+        declarations = []
+        for t in tools_config:
+            for fd in t.get("function_declarations", []):
+                declarations.append(fd)
+
+        if declarations:
+            chosen = _pick_tool(user_msg, declarations)
+            if chosen:
+                _record_call(provider, True)
+                return _gemini_tool_response(model, chosen["name"], json.loads(chosen["arguments"]))
+
+        _record_call(provider, True)
+        return _gemini_text_response(model, f"Mock response for: {user_msg}")
+    except HTTPException:
+        _record_call(provider, False)
+        raise
 
 
 @app.post("/v1/embeddings")

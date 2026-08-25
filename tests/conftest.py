@@ -273,6 +273,7 @@ def mock_api(mock_provider_server):
     mock_port = int(os.environ.get("MOCK_PROVIDER_PORT", "18889"))
     env = os.environ.copy()
     env["JARVIS_TTS_SILENT"] = "1"
+    env["JARVIS_EVAL_MODE"] = "1"
     env["JARVIS_MOCK_PROVIDERS"] = "1"
     env["JARVIS_PORT"] = "8002"
     # Same port hygiene as jarvis_server: a previous test's server may still

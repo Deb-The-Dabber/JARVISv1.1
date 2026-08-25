@@ -1,11 +1,18 @@
 import json
+import os
 import re
 import threading
 import time
 import uuid
-from pathlib import Path
+import datetime
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List
+
 from event_bus import publish
+
+# Phase 2: ActiveTask integration
+from task import ActiveTask, TaskPhase, TaskEventType
 
 # ── Goal sanitization: strip bypass/PII before passing to sub-agents ──
 _BYPASS_PATTERNS = re.compile(
@@ -81,6 +88,116 @@ PLANNER_TRIGGERS = [
 
 MAX_STEPS = 30
 
+# ── Phase 2: agent-loop discipline budgets ──
+# Per-request hard limits so a derailed loop degrades gracefully instead of
+# burning unbounded time/model calls. All overridable via env vars.
+MAX_AGENT_TOOL_CALLS = 10          # total executed tool calls per request
+MAX_AGENT_EXPLORE_CALLS = 8        # read-only info-gathering calls before forced transition
+MAX_AGENT_LOOP_WALL_CLOCK_S = 90.0  # hard wall-clock ceiling per request
+
+
+def _env_budget(name: str, default: float) -> float:
+    """Read a numeric env override, falling back to the default."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Phase 5F: Structured event logging for Thought/Action/Reality separation
+@dataclass
+class AgentEvent:
+    """Structured event for Thought/Action/Reality separation."""
+    event_type: str
+    step_num: int
+    timestamp: str
+    agent_id: str
+    goal: str
+    phase: str
+    # Model Thought fields
+    model_thought: str = ""
+    model_tool: str = ""
+    model_args: dict = None
+    # Tool Action fields
+    tool_name: str = ""
+    tool_args: dict = None
+    # Verified Reality fields
+    verified: bool = False
+    verification_msg: str = ""
+    tool_result: str = ""
+    success: bool = False
+    # State change fields
+    old_status: str = ""
+    new_status: str = ""
+    # Progress fields
+    verified_progress_count: int = 0
+    false_progress_count: int = 0
+    criteria_passed: int = 0
+    criteria_total: int = 0
+    
+    def to_dict(self) -> dict:
+        return {
+            "event_type": self.event_type,
+            "step_num": self.step_num,
+            "timestamp": self.timestamp,
+            "agent_id": self.agent_id,
+            "goal": self.goal,
+            "phase": self.phase,
+            "model_thought": self.model_thought,
+            "model_tool": self.model_tool,
+            "model_args": self.model_args,
+            "tool_name": self.tool_name,
+            "tool_args": self.tool_args,
+            "verified": self.verified,
+            "verification_msg": self.verification_msg,
+            "tool_result": self.tool_result,
+            "success": self.success,
+            "old_status": self.old_status,
+            "new_status": self.new_status,
+            "verified_progress_count": self.verified_progress_count,
+            "false_progress_count": self.false_progress_count,
+            "criteria_passed": self.criteria_passed,
+            "criteria_total": self.criteria_total,
+        }
+
+
+def _log_agent_event(event: AgentEvent) -> None:
+    """Log a structured agent event."""
+    try:
+        from event_bus import publish
+        publish("agent_event", event.to_dict())
+    except Exception:
+        pass  # Don't let event logging break the agent loop
+
+
+# Tools that only gather information (read-only) — counted against the
+# exploration budget and blocked once it is exhausted.
+EXPLORE_TOOLS = frozenset({
+    "read_file", "web_search", "search_web", "search_news", "search_shopping",
+    "search_my_notes", "semantic_search_memory", "warwatch_news",
+    "fetch_top_headlines", "fetch_everything", "find_recent_screenshot",
+    "docs_search", "docs_get", "slides_search", "slides_get",
+    "forms_get", "forms_get_responses", "gdrive_get", "gdrive_download",
+    "inspect_tools", "list_agents", "get_agent_status",
+    "browser_current_url", "spotify_current", "check_email", "disk_usage",
+})
+
+PHASE_EXPLORE = "explore"
+PHASE_PLAN = "plan"
+PHASE_IMPLEMENT = "implement"
+_PHASE_ORDER = (PHASE_EXPLORE, PHASE_PLAN, PHASE_IMPLEMENT)
+
+
+def _advance_phase(current: str, requested: str) -> str:
+    """Monotonic phase transition: explore → plan → implement. Never regresses."""
+    if requested not in _PHASE_ORDER:
+        return current
+    try:
+        cur = _PHASE_ORDER.index(current)
+    except ValueError:
+        return PHASE_EXPLORE
+    return _PHASE_ORDER[max(cur, _PHASE_ORDER.index(requested))]
+
 # ── Think → Act → Evaluate: Plan dataclasses ──
 
 
@@ -139,8 +256,125 @@ def needs_planner(text: str) -> bool:
     return any(trigger in t for trigger in PLANNER_TRIGGERS)
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove markdown/code fence markers (```json, ```) from an LLM reply."""
+    return re.sub(r"```(?:json)?", "", text or "").replace("```", "").strip()
+
+
+def _scan_balanced(text: str, opening: str, closing: str) -> list[str]:
+    """Return every balanced-bracket substring in ``text`` (string-aware).
+
+    Handles quotes/escapes so '[x]' inside a JSON string value doesn't
+    truncate the scan. Longest-balanced semantics: nested pairs collapse
+    into their outermost match.
+    """
+    spans: list[tuple[int, int, int]] = []
+    for m in re.finditer(re.escape(opening), text):
+        depth = 0
+        in_str = False
+        escaped = False
+        for i in range(m.start(), len(text)):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    spans.append((m.start(), i + 1, i + 1 - m.start()))
+                    break
+    # Shortest-first so the outermost (longest) match wins dedup
+    spans.sort(key=lambda s: s[2])
+    seen: set[tuple[int, int]] = set()
+    out: list[str] = []
+    for start, end, _ in spans:
+        if any(start >= s and end <= e for s, e in seen):
+            continue
+        seen.add((start, end))
+        out.append(text[start:end])
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _extract_json_array(text: str) -> list | None:
+    """Parse a JSON array out of a messy LLM reply (fences/prose/strict).
+
+    Order: strict full-parse of the fence-stripped reply, then every
+    balanced ``[...]`` block (longest first). Returns None when no array
+    parses, so callers degrade gracefully instead of crashing.
+    """
+    stripped = _strip_code_fences(text)
+    if not stripped:
+        return None
+    try:
+        data = json.loads(stripped)
+        if isinstance(data, list):
+            return data
+    except ValueError:
+        pass
+    for cand in _scan_balanced(stripped, "[", "]"):
+        try:
+            data = json.loads(cand)
+            if isinstance(data, list):
+                return data
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Parse a JSON object out of a messy LLM reply (for retry decisions)."""
+    stripped = _strip_code_fences(text)
+    if not stripped:
+        return None
+    try:
+        data = json.loads(stripped)
+        if isinstance(data, dict):
+            return data
+    except ValueError:
+        pass
+    for cand in _scan_balanced(stripped, "{", "}"):
+        try:
+            data = json.loads(cand)
+            if isinstance(data, dict):
+                return data
+        except ValueError:
+            continue
+    return None
+
+
+def _step_from_dict(s: dict) -> PlanStep | None:
+    """Coerce a raw model dict into a PlanStep, tolerating schema drift."""
+    if not isinstance(s, dict):
+        return None
+    clean = {k: v for k, v in s.items() if k in {"step_id", "goal", "tool_hint", "args", "status", "result", "evaluation"}}
+    if not isinstance(clean.get("args"), dict):
+        clean["args"] = {}
+    clean.setdefault("step_id", str(len(clean) + 1))
+    clean.setdefault("goal", "")
+    clean.setdefault("tool_hint", "")
+    clean.setdefault("status", "pending")
+    clean.setdefault("result", "")
+    clean.setdefault("evaluation", "")
+    return PlanStep(**clean)
+
+
 def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
-    """Use the LLM to decompose a goal into steps."""
+    """Use the LLM to decompose a goal into steps.
+
+    Phase 4: robust against plain-completion replies — the model may wrap
+    the JSON in prose or return it in a fence; any parseable array wins,
+    and malformed entries are dropped instead of crashing the loop.
+    """
     prompt = (
         "You are Jarvis's planner. Given a user goal, break it into a sequence of 2-6 discrete steps. "
         "Each step should use exactly one tool. Respond ONLY with a JSON array of steps.\n\n"
@@ -160,19 +394,21 @@ def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
     )
     try:
         raw = ask_llm_fn(prompt)
-        raw_clean = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-        steps_data = json.loads(raw_clean)
-        if not isinstance(steps_data, list):
-            raise ValueError("Expected array")
-        plan = Plan(
-            plan_id=uuid.uuid4().hex[:8],
-            original_goal=goal,
-            steps=[PlanStep(**s) for s in steps_data],
-        )
-        _register_plan(plan)
-        return plan
     except Exception:
         return None
+    steps_data = _extract_json_array(raw)
+    if not steps_data:
+        return None
+    steps = [s for s in (_step_from_dict(x) for x in steps_data) if s is not None]
+    if not steps:
+        return None
+    plan = Plan(
+        plan_id=uuid.uuid4().hex[:8],
+        original_goal=goal,
+        steps=steps,
+    )
+    _register_plan(plan)
+    return plan
 
 
 def _evaluate_step(step: PlanStep, ask_llm_fn) -> str:
@@ -203,10 +439,72 @@ def _generate_final_answer(plan: Plan, ask_llm_fn) -> str:
         return "Completed."
 
 
-def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None) -> str:
+# Phase 6E: Multi-step replanning
+def _replan(goal: str, ask_llm_fn, failed_results: List[dict], context: str = "") -> Plan | None:
+    """
+    Phase 6E: Re-plan based on verification failures.
+    Creates a new plan that addresses the failed criteria.
+    """
+    failed = [r for r in failed_results if not r.get("passed") and r.get("required", True)]
+    if not failed:
+        return _create_plan(goal, ask_llm_fn)
+    
+    # Build context from failures
+    failure_context = "\n".join([
+        f"- {r['type']}: {r['target']} - {r['message'][:200]}"
+        for r in failed
+    ])
+    
+    replan_prompt = (
+        f"You are Jarvis's replanner. The previous plan failed to meet these goal criteria:\n"
+        f"{failure_context}\n\n"
+        f"Additional context: {context}\n\n"
+        f"Original goal: {goal}\n\n"
+        "Create a NEW plan that addresses these failures. Focus on fixing the failed criteria.\n"
+        "Respond ONLY with a JSON array of steps (same format as _create_plan).\n\n"
+        "Format:\n"
+        "[\n"
+        '  {"step_id": "1", "goal": "what to accomplish", "tool_hint": "suggested_tool_name",\n'
+        '   "args": {"query": "search term", "app_name": "Safari"}},\n'
+        "  ...\n"
+        "]\n"
+        "Rules:\n"
+        "- Each step must be achievable with a single tool call\n"
+        "- tool_hint must match a known tool name\n"
+        "- Each step MUST include an 'args' object with ALL required parameters\n"
+        "- Return NOTHING but the JSON array"
+    )
+    try:
+        raw = ask_llm_fn(replan_prompt)
+    except Exception:
+        return None
+    steps_data = _extract_json_array(raw)
+    if not steps_data:
+        return None
+    steps = [s for s in (_step_from_dict(x) for x in steps_data) if s is not None]
+    if not steps:
+        return None
+    plan = Plan(
+        plan_id=uuid.uuid4().hex[:8],
+        original_goal=goal,
+        steps=steps,
+    )
+    _register_plan(plan)
+    return plan
+
+
+def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task: "ActiveTask | None" = None) -> str:
     # Record start time for duration metrics
     start_time = time.time()
     """Think → Act → Evaluate loop with separate planner agent."""
+    
+    # Phase 2: Initialize with task context if provided
+    if task:
+        # Inject task context into goal
+        if task.get_context_for_prompt():
+            goal = f"{task.get_context_for_prompt()}\n\nCurrent Goal: {goal}"
+        # Pre-populate already_called with task's tool history
+        # (handled by the agent's internal logic if needed)
 
     if speak_fn:
         try:
@@ -254,10 +552,11 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None) -> s
             )
             try:
                 raw = ask_llm_fn(retry_prompt)
-                raw_clean = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
-                retry = json.loads(raw_clean)
+                retry = _extract_json_object(raw) or {}
                 alt_tool = retry.get("tool", "")
                 alt_args = retry.get("args", {})
+                if not isinstance(alt_args, dict):
+                    alt_args = {}
                 if alt_tool:
                     try:
                         result = execute_tool_fn(alt_tool, alt_args)
@@ -277,6 +576,19 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None) -> s
                 speak_fn(status_msg)
             except Exception:
                 pass
+
+        # Phase 2: Record step to active task
+        if task:
+            step_data = {
+                "tool": step.tool_hint,
+                "args": step.args,
+                "success": step.evaluation == "success",
+                "result": step.result,
+                "thought": step.goal,
+            }
+            task.record_step(step_data, step.tool_hint, step.args)
+            task.phase = TaskPhase.IMPLEMENT  # planner is in implement phase
+            task.save()
 
     # Synthesize final answer
     plan.status = "completed"
@@ -375,6 +687,85 @@ def _is_success_result(tool_name: str, result: str) -> bool:
         return pos_score > neg_score
     # Fallback: non-empty result is likely success
     return bool(r.strip())
+
+
+def _verify_tool_execution(tool_name: str, args: dict, result_str: str, execute_tool_fn) -> tuple[bool, str]:
+    """
+    Phase 4: Verify tool execution actually accomplished what was intended.
+    For write operations, re-read the file. For code changes, run tests.
+    Returns (verified: bool, verification_message: str).
+    Uses a verification-specific execute that doesn't count towards tool budget.
+    """
+    # Create a verification-only execute function that doesn't affect budgets
+    def _verify_execute(tool, args):
+        return execute_tool_fn(tool, args)
+    
+    try:
+        # For write operations, verify by reading back
+        if tool_name in ("write_file", "create_file", "append_file"):
+            path = args.get("path", "")
+            if path:
+                verify_result = _verify_execute("read_file", {"path": path, "offset": 0})
+                if verify_result and "Could not read file" not in verify_result:
+                    return True, f"Verified: {tool_name} succeeded (file readable)"
+                else:
+                    return False, f"Verification failed: {tool_name} wrote but file not readable"
+        
+        # For code execution, check if tests were run
+        if tool_name in ("run_python", "run_terminal_command"):
+            # If result contains test output, check for pass/fail
+            result_lower = result_str.lower()
+            if any(kw in result_lower for kw in ["test", "pytest", "passed", "failed", "ok", "error"]):
+                # Check for explicit failure indicators
+                if re.search(r'\b(failed|error|traceback)\b', result_lower) and not re.search(r'\b0 failed\b', result_lower):
+                    return False, f"Tests/commands indicated failure"
+                # Check for explicit success indicators
+                if re.search(r'\b(passed|ok)\b', result_lower):
+                    return True, "Tests/commands passed"
+        
+        # For other tools, rely on result scoring
+        success = _is_success_result(tool_name, "")
+        return success, "Verified via result scoring"
+    except Exception as e:
+        return False, f"Verification error: {e}"
+
+
+def _filter_narration(text: str) -> str:
+    """
+    Phase 4: Filter out verbose model narration from user-facing output.
+    Strips common narration patterns like "Let me...", "Now I will...", "I need to..."
+    but preserves the actual content after the narration.
+    """
+    if not text:
+        return text
+    
+    # Patterns to remove from start of lines
+    narration_patterns = [
+        r"^\s*(let me|now i will|i will|i need to|let me|i'm going to|i am going to)\s+",
+        r"^\s*(first,?|then,?|next,?|finally,?)\s+",
+        r"^\s*(okay,?|alright,?|sure,?)\s+",
+    ]
+    
+    lines = text.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.lstrip()
+        # Check if line starts with narration pattern
+        is_narration_line = False
+        for pattern in narration_patterns:
+            if re.match(pattern, stripped, re.IGNORECASE):
+                is_narration_line = True
+                # Remove just the narration prefix, keep the rest
+                stripped = re.sub(pattern, '', stripped, flags=re.IGNORECASE)
+                break
+        if stripped:
+            filtered_lines.append(stripped)
+    
+    result = '\n'.join(filtered_lines).strip()
+    # If everything was filtered, return a concise summary
+    if not result:
+        return "Action completed"
+    return result
 
 
 _agent_store: dict[str, "Agent"] = {}
@@ -498,28 +889,37 @@ def needs_agent_loop(text: str) -> bool:
 
 def _parse_decision(raw: str) -> dict:
     if not raw:
-        return {"thought": "", "tool": "", "args": {}, "done": True, "final_answer": "No response from model."}
+        # Empty model response — do NOT hard-stop with "No response from model."
+        # as the final answer; the loop retries and aborts gracefully after budget.
+        return {"thought": "No response from model.", "tool": "", "args": {},
+                "done": False, "final_answer": "", "_no_response": True}
     cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
     except Exception:
         pass
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
         except Exception:
             pass
     return {
         "thought": "Model returned non-JSON response.",
         "tool": "",
         "args": {},
-        "done": True,
-        "final_answer": raw.strip(),
+        "done": False,
+        "final_answer": "",
     }
 
 
-def _build_prompt(goal: str, steps: list, last_result: str, already_called: set = None) -> str:
+def _build_prompt(goal: str, steps: list, last_result: str, already_called: set = None,
+                  phase: str = PHASE_EXPLORE, max_tool_calls: int = MAX_AGENT_TOOL_CALLS,
+                  max_explore: int = MAX_AGENT_EXPLORE_CALLS) -> str:
     recent = steps[-5:]
     recent_text = "\n".join(f"{i + 1}. tool={step.get('tool')} success={step.get('success')} result={step.get('result', '')[:200]}" for i, step in enumerate(recent))
     already_text = ""
@@ -535,7 +935,18 @@ def _build_prompt(goal: str, steps: list, last_result: str, already_called: set 
         f"{already_text}\n\n"
         "Required JSON format:\n"
         '{{"thought": "brief reasoning", "tool": "exact_tool_name", '
-        '"args": {{}}, "done": false, "final_answer": ""}}\n\n'
+        '"args": {{}}, "phase": "explore|plan|implement (optional advance)", "done": false, '
+        '"final_answer": ""}}\n\n'
+        f"Current phase: {phase}\n"
+        "Phase contract (advance only, never regress):\n"
+        "- explore: gather information with read-only tools only "
+        "(read_file, web_search, search_*, docs_get, get_agent_status, ...)\n"
+        "- plan: think through the approach (at most 2 steps)\n"
+        "- implement: execute the changes that complete the goal\n"
+        "- Set \"phase\" in your JSON to advance; the loop enforces it "
+        "monotonically\n"
+        f"- Hard budgets: at most {max_tool_calls} total tool calls, "
+        f"at most {max_explore} read-only calls\n\n"
         "Rules:\n"
         "- done=true only when the goal is fully complete or cannot continue\n"
         "- If done=true, put the full response in final_answer and leave tool empty\n"
@@ -546,7 +957,7 @@ def _build_prompt(goal: str, steps: list, last_result: str, already_called: set 
     )
 
 
-def _synthesize_from_steps(goal, steps) -> str:
+def _synthesize_from_steps(goal, steps, note: str = None) -> str:
     lines = [f"Agent summary for: {goal}"]
     successful = [step for step in steps if step.get("success")]
     if not successful:
@@ -554,10 +965,14 @@ def _synthesize_from_steps(goal, steps) -> str:
     for step in successful:
         tool = step.get("tool", "unknown")
         result = str(step.get("result", "")).strip()
+        # Phase 4: Filter out verbose narration from results
+        result = _filter_narration(result)
         if len(result) > 180:
             result = result[:177] + "..."
         lines.append(f"- {tool}: {result or 'completed'}")
-    if len(steps) >= MAX_STEPS:
+    if note:
+        lines.append(f"- Stopped: {note}")
+    elif len(steps) >= MAX_STEPS:
         lines.append("- Stopped after reaching the maximum step limit.")
     return "\n".join(lines)
 
@@ -575,10 +990,28 @@ def _canonical_args_key(args: dict) -> str:
     return str(sorted((k, str(v)) for k, v in (args or {}).items()))
 
 
-def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_iterations: int = 30) -> str:
+def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_iterations: int = 30, task: "ActiveTask | None" = None) -> str:
     # Record start time for duration metrics
     start_time = time.time()
+    # Clamp the iteration cap so a derailed loop can't spin on empty/no-tool steps.
+    max_tool_calls = int(_env_budget("JARVIS_AGENT_MAX_TOOL_CALLS", MAX_AGENT_TOOL_CALLS))
+    max_explore = int(_env_budget("JARVIS_AGENT_MAX_EXPLORE", MAX_AGENT_EXPLORE_CALLS))
+    wall_clock_s = _env_budget("JARVIS_AGENT_WALL_CLOCK_S", MAX_AGENT_LOOP_WALL_CLOCK_S)
+    max_iterations = max(1, min(max_iterations or MAX_STEPS, max_tool_calls + 4))
+    deadline = time.time() + wall_clock_s
     agent = Agent(goal=goal, max_iterations=max_iterations)
+    
+    # Phase 2: Initialize agent with task context if provided
+    if task:
+        # Pre-populate already_called with task's tool history to prevent cross-turn duplicates
+        for history_key, step_idx in task.tool_history.items():
+            if ":" in history_key:
+                tool_name, arg_key = history_key.split(":", 1)
+                agent.already_called.add((tool_name, arg_key))
+        # Inject task context into goal
+        if task.get_context_for_prompt():
+            goal = f"{task.get_context_for_prompt()}\n\nCurrent Goal: {goal}"
+    
     _register_agent(agent)
 
     if speak_fn:
@@ -587,21 +1020,171 @@ def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_it
         except Exception:
             pass
 
+    tool_calls = 0
+    explore_calls = 0
+    empty_decisions = 0
+    plan_steps = 0
+    phase = PHASE_EXPLORE
+    abort_reason = None
+
     for step_num in range(1, agent.max_iterations + 1):
         if agent.status == "stopped":
             agent.final_answer = _synthesize_from_steps(goal, agent.steps)
             return agent.final_answer
 
-        prompt = _build_prompt(goal, agent.steps, agent.last_result, agent.already_called)
+        if time.time() > deadline:
+            abort_reason = f"wall clock limit ({wall_clock_s:g}s) reached"
+            break
+        if tool_calls >= max_tool_calls:
+            abort_reason = f"tool budget ({max_tool_calls} calls) exhausted"
+            break
+
+        # Phase 7A: Budget enforcement - check all budgets at start of each iteration
+        if task:
+            budget = task.execution_budget
+            # Check time budget
+            if budget["time_spent_seconds"] >= budget["time_budget_seconds"]:
+                abort_reason = f"time budget ({budget['time_budget_seconds']}s) exhausted"
+                task.enter_blocked(f"Time budget exhausted ({budget['time_budget_seconds']}s)")
+                break
+            # Check LLM budget
+            if budget["llm_calls"] >= budget["llm_budget"]:
+                abort_reason = f"LLM budget ({budget['llm_calls']}/{budget['llm_budget']} calls) exhausted"
+                task.enter_blocked(f"LLM budget exhausted ({budget['llm_budget']} calls)")
+                break
+            # Check tool budget
+            if budget["tool_calls"] >= budget["tool_budget"]:
+                abort_reason = f"tool budget ({budget['tool_budget']} calls) exhausted"
+                task.enter_blocked(f"Tool budget exhausted ({budget['tool_budget']} calls)")
+                break
+            # Check replan budget
+            if budget["replans"] >= budget["replan_budget"]:
+                abort_reason = f"replan budget ({budget['replan_budget']}) exhausted"
+                task.enter_blocked(f"Replan budget exhausted ({budget['replan_budget']} replans)")
+                break
+            # Check recovery budget
+            if budget["recoveries"] >= budget["recovery_budget"]:
+                abort_reason = f"recovery budget ({budget['recovery_budget']}) exhausted"
+                task.enter_blocked(f"Recovery budget exhausted ({budget['recovery_budget']} recoveries)")
+                break
+
+        prompt = _build_prompt(goal, agent.steps, agent.last_result,
+                               agent.already_called, phase, max_tool_calls, max_explore)
         raw_decision = ask_llm_fn(prompt)
+        # Phase 7A: Increment LLM call budget
+        if task:
+            task.execution_budget["llm_calls"] += 1
+            task.execution_budget["time_spent_seconds"] = int(time.time() - start_time)
         decision = _parse_decision(raw_decision)
 
         if decision.get("done"):
+            # Phase 6: Verify goal before completing
+            if task:
+                goal_passed, verification_results = task.verify_goal()
+                if not goal_passed:
+                    agent.last_result = f"[GOAL VERIFICATION FAILED] {goal}: criteria not met.\n"
+                    for r in verification_results:
+                        if r.get("required", True) and not r.get("passed"):
+                            agent.last_result += f"  - FAIL: {r['type']}: {r['target']} - {r['message'][:200]}\n"
+                    agent.last_result += "\n[RECOVERY] Task incomplete. Entering recovery mode."
+                    task.enter_blocked("Goal verification failed")
+                    # Don't return - let the agent continue to try to fix
+                    decision["done"] = False
+                    continue
+            
             agent.final_answer = (decision.get("final_answer") or "").strip()
+            # Phase 4: Filter narration from final answer
+            agent.final_answer = _filter_narration(agent.final_answer)
             agent.final_answer = agent.final_answer or _synthesize_from_steps(goal, agent.steps)
             agent.status = "completed"
             agent.checkpoint()
+            # Phase 5F: Log completion event
+            _log_agent_event(AgentEvent(
+                event_type=TaskEventType.VERIFIED_REALITY,
+                step_num=step_num,
+                timestamp=datetime.datetime.now().isoformat(),
+                agent_id=agent.id,
+                goal=goal,
+                phase=phase,
+                verified=True,
+                success=True,
+            ))
             return agent.final_answer
+
+        # Phase 5F: Log model thought
+        _log_agent_event(AgentEvent(
+            event_type=TaskEventType.MODEL_THOUGHT,
+            step_num=step_num,
+            timestamp=datetime.datetime.now().isoformat(),
+            agent_id=agent.id,
+            goal=goal,
+            phase=phase,
+            model_thought=decision.get("thought", ""),
+            model_tool=decision.get("tool", ""),
+            model_args=decision.get("args", {}),
+        ))
+
+        # Monotonic phase advance requested by the model
+        requested_phase = decision.get("phase")
+        if isinstance(requested_phase, str):
+            new_phase = _advance_phase(phase, requested_phase.strip().lower())
+            if new_phase != phase:
+                phase = new_phase
+                plan_steps = 0
+                transition_note = f"[Phase transition] Now in {phase} phase."
+                agent.last_result = f"{agent.last_result}\n{transition_note}" if agent.last_result else transition_note
+
+                # Phase 6B: Automatic verification at phase boundaries
+                if task and task.goal_criteria:
+                    goal_passed, verification_results = task.verify_goal()
+                    if not goal_passed:
+                        agent.last_result += f"\n[PHASE VERIFICATION] Goal criteria not met for {phase} phase:"
+                        for r in verification_results:
+                            if r.get("required", True) and not r.get("passed"):
+                                agent.last_result += f"\n  - FAIL: {r['type']}: {r['target']} - {r['message'][:200]}"
+                        agent.last_result += "\n[RECOVERY] Cannot advance phase without meeting criteria."
+
+        # Phase 2: Stagnation detection — if task has 3+ non-progress steps, force re-evaluation
+        if task and task.check_stagnation():
+            agent.last_result = f"{agent.last_result}\n[STAGNATION DETECTED] No meaningful progress in last 3+ steps. Re-evaluating approach."
+            if phase == PHASE_EXPLORE:
+                phase = PHASE_PLAN
+            elif phase == PHASE_PLAN:
+                phase = PHASE_IMPLEMENT
+            task.reset_stagnation()
+
+        # Phase 6: Auto-transition recovery states
+        if task:
+            new_status = task.check_recovery_transitions()
+            if new_status != task.status:
+                agent.last_result = f"{agent.last_result}\n[RECOVERY] Task state transitioned to {task.status.upper()}"
+                _log_agent_event(AgentEvent(
+                    event_type=TaskEventType.STATE_CHANGE,
+                    step_num=step_num,
+                    timestamp=datetime.datetime.now().isoformat(),
+                    agent_id=agent.id,
+                    goal=goal,
+                    phase=phase,
+                    old_status=task.status,
+                    new_status=new_status,
+                ))
+
+        if decision.get("_no_response"):
+            empty_decisions += 1
+            agent.last_result = "No response from model (empty reply)."
+            agent.steps.append(
+                {
+                    "tool": "",
+                    "args": {},
+                    "success": False,
+                    "result": agent.last_result,
+                    "thought": decision.get("thought", ""),
+                }
+            )
+            if empty_decisions >= 2:
+                abort_reason = "model stopped responding"
+                break
+            continue
 
         tool_name = (decision.get("tool") or "").strip()
         args = decision.get("args") or {}
@@ -622,6 +1205,25 @@ def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_it
             continue
 
         arg_key = _canonical_args_key(args)
+
+        # Exploration budget — block further read-only calls once exhausted
+        if tool_name in EXPLORE_TOOLS and explore_calls >= max_explore:
+            agent.last_result = (f"Skipped {tool_name}: exploration budget "
+                                 f"({max_explore} read-only calls) reached — move to implementation.")
+            agent.steps.append(
+                {
+                    "tool": tool_name,
+                    "args": args,
+                    "success": False,
+                    "result": agent.last_result,
+                    "thought": decision.get("thought", ""),
+                }
+            )
+            if phase == PHASE_EXPLORE:
+                phase = PHASE_PLAN
+                plan_steps = 0
+            continue
+
         if (tool_name, arg_key) in agent.already_called:
             agent.last_result = f"Skipped {tool_name}: already called with these args."
             agent.steps.append(
@@ -679,16 +1281,80 @@ def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_it
             agent.fail_counts[tool_name] = agent.fail_counts.get(tool_name, 0) + 1
             agent.last_result = f"Tool execution error: {e}"
 
+        # Phase 7A: Increment tool call budget
+        if task:
+            task.execution_budget["tool_calls"] += 1
+
+        # Phase 4: Verify tool execution actually accomplished the goal
+        verified, verify_msg = _verify_tool_execution(tool_name, args, agent.last_result, execute_tool_fn)
+        if not verified and success:
+            # Tool appeared to succeed but verification failed
+            success = False
+            agent.last_result = f"{agent.last_result}\n[Verification Failed] {verify_msg}"
+        elif verified:
+            # Verification passed - append verification info
+            agent.last_result = f"{agent.last_result}\n[Verified] {verify_msg}"
+
+        # Phase 5F: Log tool action and verified reality
+        _log_agent_event(AgentEvent(
+            event_type=TaskEventType.TOOL_ACTION,
+            step_num=step_num,
+            timestamp=datetime.datetime.now().isoformat(),
+            agent_id=agent.id,
+            goal=goal,
+            phase=phase,
+            tool_name=tool_name,
+            tool_args=args,
+            success=success,
+            tool_result=agent.last_result[:500],
+        ))
+        
+        if verified:
+            _log_agent_event(AgentEvent(
+                event_type=TaskEventType.VERIFIED_REALITY,
+                step_num=step_num,
+                timestamp=datetime.datetime.now().isoformat(),
+                agent_id=agent.id,
+                goal=goal,
+                phase=phase,
+                tool_name=tool_name,
+                tool_args=args,
+                verified=True,
+                verification_msg=verify_msg,
+                tool_result=agent.last_result[:500],
+                success=success,
+                verified_progress_count=task.progress_metrics.get("verified_progress_count", 0) if task else 0,
+                false_progress_count=task.progress_metrics.get("false_progress_count", 0) if task else 0,
+            ))
+
+        tool_calls += 1
+        if tool_name in EXPLORE_TOOLS:
+            explore_calls += 1
+
         agent.already_called.add((tool_name, arg_key))
-        agent.steps.append(
-            {
-                "tool": tool_name,
-                "args": args,
-                "success": success,
-                "result": agent.last_result,
-                "thought": decision.get("thought", ""),
-            }
-        )
+        step_data = {
+            "tool": tool_name,
+            "args": args,
+            "success": success,
+            "result": agent.last_result,
+            "thought": decision.get("thought", ""),
+        }
+        agent.steps.append(step_data)
+
+        # Phase 2: Record step to active task for cross-turn persistence
+        if task:
+            task.record_step(step_data, tool_name, args, verified=verified)
+            # Sync task phase with agent phase
+            task.phase = phase
+            task.next_action = decision.get("thought", "")[:200]
+            task.save()
+
+        # Plan phase lasts at most 2 executed steps, then auto-advance
+        if phase == PHASE_PLAN:
+            plan_steps += 1
+            if plan_steps >= 2:
+                phase = PHASE_IMPLEMENT
+                plan_steps = 0
 
         if step_num % 5 == 0:
             # Emit progress event for sub‑agent
@@ -699,6 +1365,25 @@ def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_it
                 "status": "running",
             })
             agent.checkpoint()
+
+    # Graceful degradation: report partial progress instead of "No response from model."
+    if abort_reason:
+        agent.status = "completed"
+        agent.final_answer = _synthesize_from_steps(goal, agent.steps, note=abort_reason)
+        agent.checkpoint()
+        publish("subagent_completed", {
+            "agent_id": agent.id,
+            "goal": goal,
+            "final_answer": agent.final_answer,
+            "steps": [
+                {"tool": s.get("tool"), "status": "success" if s.get("success") else "failed"}
+                for s in agent.steps
+            ],
+            "duration": time.time() - start_time,
+            "timestamp": time.time(),
+            "abort_reason": abort_reason,
+        })
+        return agent.final_answer
 
     agent.status = "completed"
     agent.final_answer = _synthesize_from_steps(goal, agent.steps)

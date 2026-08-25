@@ -1,3 +1,4 @@
+import atexit
 import datetime
 import os
 import subprocess
@@ -83,7 +84,13 @@ def _emit_event(category: str, event: str, detail: str = "", *, alert_type: str 
 # CAFFEINATE — prevent idle sleep
 # ─────────────────────────────────────────────
 def start_caffeinate():
-    """Prevent Mac from sleeping while Jarvis is running."""
+    """Prevent Mac from sleeping while Jarvis is running (idempotent — one per process)."""
+    if os.getenv("JARVIS_EVAL_MODE") == "1":
+        # Test servers: never spawn OS processes that outlive the server.
+        return
+    existing = _state.get("caffeinate_proc")
+    if existing is not None and existing.poll() is None:
+        return
     try:
         # Check if on battery
         battery = psutil.sensors_battery()
@@ -98,9 +105,16 @@ def start_caffeinate():
 
 
 def stop_caffeinate():
-    if _state["caffeinate_proc"]:
-        _state["caffeinate_proc"].terminate()
-        _state["caffeinate_proc"] = None
+    proc = _state.get("caffeinate_proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _state["caffeinate_proc"] = None
+
+
+atexit.register(stop_caffeinate)
 
 
 # ─────────────────────────────────────────────

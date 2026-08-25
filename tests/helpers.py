@@ -9,7 +9,7 @@ def assert_tool_called(response_text: str, tool_name: str) -> bool:
 def assert_provider_used(response_text: str, provider: str) -> bool:
     provider_keywords = {
         "nemotron": ["Nemotron", "NVIDIA"],
-        "groq": ["Groq", "llama-3.3-70b"],
+        "groq": ["Groq", "compound-mini"],
         "openrouter": ["OpenRouter"],
         "deepseek": ["DeepSeek"],
         "gemini": ["Gemini"],

@@ -142,7 +142,7 @@ NIM_MODEL_FRONTIER = [
 # Defined but NOT registered as an active routing slot: the E4 probe must
 # prove reliable (<10s) latency first (2026-08-13 probe: 21.7s for 1 token).
 NIM_MODEL_REASONING = ["nvidia/nemotron-3-super-120b-a12b"]
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = _env("JARVIS_GROQ_MODEL") or "groq/compound-mini"
 # OpenRouter: the ':free' slug for llama-3.1-8b was pulled (404 "unavailable
 # for free" — provider suggests the plain, paid-but-cheap slug). Override in
 # .env via OPENROUTER_MODEL.
@@ -449,6 +449,9 @@ def _classify_error(error_text: str) -> str | None:
         return "unknown"
     if "429" in err or "rate limit" in err or "rate_limit" in err or "too many requests" in err:
         return "rate_limit"
+    if ("402" in err or "payment required" in err or "insufficient credits" in err
+            or "no credits" in err or "billing" in err or "accounts have insufficient balance" in err):
+        return "permanent"
     if "401" in err or "403" in err or "unauthorized" in err or "invalid api key" in err:
         return "auth_error"
     if "permission denied" in err or "forbidden" in err:
@@ -476,6 +479,14 @@ def _handle_provider_failure(provider_name: str, exc: Exception) -> None:
     Calls ``_record_provider_failure`` and ``_backoff_provider`` with a duration based on the error type.
     """
     label = _classify_error(str(exc))
+    if label == "permanent":
+        # 401/402/403-style: the account/config is broken, not the network.
+        # Retire the provider until it serves a successful reply (e.g. the key
+        # is fixed or credits are topped up) so every failover request no
+        # longer re-hits a dead payment wall (observed: 11x 402 in one session).
+        _record_provider_failure(provider_name)
+        _retire_provider(provider_name, str(exc)[:200])
+        return
     if label == "resolution":
         # Quality failure (tool loop never resolved) — record the health dip
         # but do NOT touch the circuit breaker: _backoff_provider(name, 0)
@@ -537,6 +548,70 @@ _provider_usage_count = {}
 _provider_health_scores = {}
 _provider_health: dict[str, dict] = {}  # {name: {total, successes, failures, avg_latency, last_success, last_failure, circuit_open, health_score}}
 _nemotron_usage_count = 0
+
+# ── Phase 3: permanent provider retirement ──
+# A provider that serves 401/402/403 (bad key, no credits) is retired until it
+# serves a successful reply, so failover requests stop re-hitting a dead wall.
+# Persisted inside _PROVIDER_HEALTH_FILE under the "__retired__" meta key.
+_PROVIDER_RETIRED: dict[str, str] = {}
+_PROVIDER_HEALTH_META_RETIRED = "__retired__"
+
+# ── Phase 3: per-request provider attempt budget ──
+# Total provider-slot attempts allowed per ask_with_tools request. A derailed
+# chain can no longer burn every provider (and its retries) on one message.
+# Reset at the top of each request (thread-local).
+JARVIS_PROVIDER_REQUEST_BUDGET = float(os.getenv("JARVIS_PROVIDER_REQUEST_BUDGET", "6"))
+_request_budget = threading.local()
+
+# ── Phase 3: provider health concurrency protection ──
+# Protects all mutations to provider health globals:
+# _provider_consecutive_failures, _provider_backoff_until, _PROVIDER_RETIRED,
+# _provider_health_scores, _provider_usage_count, _provider_health
+_provider_health_lock = threading.RLock()
+
+
+def _provider_budget_init() -> int:
+    try:
+        budget = int(JARVIS_PROVIDER_REQUEST_BUDGET)
+    except (TypeError, ValueError):
+        budget = 6
+    _request_budget.remaining = max(1, budget)
+    return _request_budget.remaining
+
+
+def _provider_budget_try(provider_name: str) -> bool:
+    """Reserve one provider attempt if any budget remains for this request."""
+    remaining = getattr(_request_budget, "remaining", 0)
+    if remaining <= 0:
+        _debug(f"[Budget] Provider attempt budget exhausted — skipping {provider_name}")
+        return False
+    if remaining == 1:
+        _debug("[Budget] Final provider attempt in this request")
+    _request_budget.remaining = remaining - 1
+    return True
+
+
+def _provider_budget_left() -> int:
+    return getattr(_request_budget, "remaining", 0)
+
+
+def _retire_provider(provider_name: str, reason: str):
+    with _provider_health_lock:
+        _PROVIDER_RETIRED[provider_name] = reason[:200]
+        _debug(f"Retired {provider_name} permanently: {reason[:120]}")
+        _save_provider_health()
+
+
+def _unretire_provider(provider_name: str):
+    with _provider_health_lock:
+        if provider_name in _PROVIDER_RETIRED:
+            _PROVIDER_RETIRED.pop(provider_name, None)
+            _debug(f"Un-retired {provider_name} (served a successful reply)")
+            _save_provider_health()
+
+
+def is_provider_retired(provider_name: str) -> bool:
+    return provider_name in _PROVIDER_RETIRED
 _tool_call_names: list[str] = []
 _turn_memo_cache: dict[str, str] = {}
 _current_request_id = ""
@@ -615,6 +690,20 @@ class ConversationContext:
 
 
 conversation_context = ConversationContext()
+
+
+from task import (
+    ActiveTask,
+    TaskPhase,
+    TaskStatus,
+    get_active_task,
+    set_active_task,
+    create_task,
+    continue_task,
+    complete_task,
+    get_task_context_for_prompt,
+    is_continuation_request,
+)
 
 
 def get_conversation_context() -> dict:
@@ -1299,39 +1388,42 @@ def _default_health_entry() -> dict:
 
 
 def _record_provider_failure(provider_name: str):
-    _provider_consecutive_failures[provider_name] = _provider_consecutive_failures.get(provider_name, 0) + 1
-    count = _provider_consecutive_failures[provider_name]
-    _provider_health_scores[provider_name] = max(0, _provider_health_scores.get(provider_name, 100) - 10)
-    h = _provider_health.setdefault(provider_name, _default_health_entry())
-    h["health_score"] = _provider_health_scores[provider_name]
-    h["failures"] += 1
-    h["total"] += 1
-    h["last_failure"] = datetime.datetime.now().isoformat()
-    if count >= CIRCUIT_BREAKER_THRESHOLD:
-        _backoff_provider(provider_name, CIRCUIT_BREAKER_TIMEOUT)
-        h["circuit_open"] = True
-        _debug(f"Circuit breaker tripped for {provider_name} ({count} consecutive failures)")
-        _provider_consecutive_failures[provider_name] = 0
-    _save_provider_health()
+    with _provider_health_lock:
+        _provider_consecutive_failures[provider_name] = _provider_consecutive_failures.get(provider_name, 0) + 1
+        count = _provider_consecutive_failures[provider_name]
+        _provider_health_scores[provider_name] = max(0, _provider_health_scores.get(provider_name, 100) - 10)
+        h = _provider_health.setdefault(provider_name, _default_health_entry())
+        h["health_score"] = _provider_health_scores[provider_name]
+        h["failures"] += 1
+        h["total"] += 1
+        h["last_failure"] = datetime.datetime.now().isoformat()
+        if count >= CIRCUIT_BREAKER_THRESHOLD:
+            _backoff_provider(provider_name, CIRCUIT_BREAKER_TIMEOUT)
+            h["circuit_open"] = True
+            _debug(f"Circuit breaker tripped for {provider_name} ({count} consecutive failures)")
+            _provider_consecutive_failures[provider_name] = 0
+        _save_provider_health()
 
 
 def _record_provider_success(provider_name: str, latency: float = 0.0):
-    _provider_consecutive_failures.pop(provider_name, None)
-    _provider_backoff_until.pop(provider_name, None)
-    _provider_health_scores[provider_name] = min(100, _provider_health_scores.get(provider_name, 100) + 5)
-    _provider_usage_count[provider_name] = _provider_usage_count.get(provider_name, 0) + 1
-    h = _provider_health.setdefault(provider_name, _default_health_entry())
-    h["health_score"] = _provider_health_scores[provider_name]
-    h["successes"] += 1
-    h["total"] += 1
-    h["last_success"] = datetime.datetime.now().isoformat()
-    h["circuit_open"] = False
-    h.pop("circuit_open_until", None)
-    # Rolling average latency
-    prev_avg = h["avg_latency"]
-    n = h["successes"]
-    h["avg_latency"] = ((prev_avg * (n - 1)) + latency) / n if n > 1 else latency
-    _save_provider_health()
+    with _provider_health_lock:
+        _provider_consecutive_failures.pop(provider_name, None)
+        _provider_backoff_until.pop(provider_name, None)
+        _unretire_provider(provider_name)
+        _provider_health_scores[provider_name] = min(100, _provider_health_scores.get(provider_name, 100) + 5)
+        _provider_usage_count[provider_name] = _provider_usage_count.get(provider_name, 0) + 1
+        h = _provider_health.setdefault(provider_name, _default_health_entry())
+        h["health_score"] = _provider_health_scores[provider_name]
+        h["successes"] += 1
+        h["total"] += 1
+        h["last_success"] = datetime.datetime.now().isoformat()
+        h["circuit_open"] = False
+        h.pop("circuit_open_until", None)
+        # Rolling average latency
+        prev_avg = h["avg_latency"]
+        n = h["successes"]
+        h["avg_latency"] = ((prev_avg * (n - 1)) + latency) / n if n > 1 else latency
+        _save_provider_health()
 
 
 def get_provider_health() -> dict[str, dict]:
@@ -1344,38 +1436,61 @@ def get_provider_health() -> dict[str, dict]:
         if entry["backoff_until"]:
             entry["backoff_remaining_s"] = max(0, entry["backoff_until"] - now_ts)
         entry["consecutive_failures"] = _provider_consecutive_failures.get(name, 0)
+        if name in _PROVIDER_RETIRED:
+            entry["retired"] = True
+            entry["retired_reason"] = _PROVIDER_RETIRED[name]
         result[name] = entry
     # Include any providers in usage_count but not yet in _provider_health
     for name in _provider_usage_count:
         if name not in result:
             result[name] = _default_health_entry()
             result[name]["usage_count"] = _provider_usage_count.get(name, 0)
+    # Include retired providers even if they never recorded health/usage
+    for name in _PROVIDER_RETIRED:
+        if name not in result:
+            result[name] = _default_health_entry()
+        result[name]["retired"] = True
+        result[name]["retired_reason"] = _PROVIDER_RETIRED[name]
     return result
 
 
 def _save_provider_health():
     """Persist provider health state to disk (Phase 1.6)."""
-    try:
-        os.makedirs(os.path.dirname(_PROVIDER_HEALTH_FILE), exist_ok=True)
-        with open(_PROVIDER_HEALTH_FILE, "w") as fh:
-            json.dump(_provider_health, fh, indent=2)
-    except Exception as e:
-        _debug(f"Failed to save provider health: {e}")
+    if JARVIS_MOCK_PROVIDERS:
+        # Never write real health/retired state while tests are pinning providers
+        # to the mock — otherwise a test 402 would retire a real provider forever.
+        return
+    with _provider_health_lock:
+        try:
+            os.makedirs(os.path.dirname(_PROVIDER_HEALTH_FILE), exist_ok=True)
+            snapshot = dict(_provider_health)
+            if _PROVIDER_RETIRED:
+                snapshot[_PROVIDER_HEALTH_META_RETIRED] = dict(_PROVIDER_RETIRED)
+            with open(_PROVIDER_HEALTH_FILE, "w") as fh:
+                json.dump(snapshot, fh, indent=2)
+        except Exception as e:
+            _debug(f"Failed to save provider health: {e}")
 
 
 def _load_provider_health():
     """Restore provider health state from disk (Phase 1.6)."""
-    try:
-        if os.path.exists(_PROVIDER_HEALTH_FILE):
-            with open(_PROVIDER_HEALTH_FILE, "r") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict):
-                _provider_health.clear()
-                for name, h in data.items():
-                    _provider_health[name] = h
-                    _provider_health_scores[name] = h.get("health_score", 100)
-    except Exception as e:
-        _debug(f"Failed to load provider health: {e}")
+    with _provider_health_lock:
+        try:
+            if os.path.exists(_PROVIDER_HEALTH_FILE):
+                with open(_PROVIDER_HEALTH_FILE, "r") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    _provider_health.clear()
+                    retired = data.pop(_PROVIDER_HEALTH_META_RETIRED, {}) or {}
+                    _PROVIDER_RETIRED.clear()
+                    _PROVIDER_RETIRED.update(
+                        {k: str(v)[:200] for k, v in retired.items() if isinstance(v, str)}
+                    )
+                    for name, h in data.items():
+                        _provider_health[name] = h
+                        _provider_health_scores[name] = h.get("health_score", 100)
+        except Exception as e:
+            _debug(f"Failed to load provider health: {e}")
 
 
 def _load_gemini_usage():
@@ -1461,22 +1576,25 @@ def _debug_provider_response(provider_name: str, label: str, response):
 
 
 def _backoff_provider(provider_name: str, seconds: int = 600, exponential: bool = True):
-    failures = _provider_consecutive_failures.get(provider_name, 0)
-    if exponential and failures > 0:
-        seconds = min(seconds * (2**failures), 3600)
-    now = datetime.datetime.now().timestamp()
-    _provider_backoff_until[provider_name] = now + seconds
-    # circuit_open_until: separate immutable timeout — doesn't reset until cleared by success
-    circuit_seconds = max(seconds, 300)
-    h = _provider_health.setdefault(provider_name, _default_health_entry())
-    h["circuit_open_until"] = now + circuit_seconds
-    h["circuit_open"] = True
-    _provider_health_scores[provider_name] = max(0, _provider_health_scores.get(provider_name, 100) - 20)
-    health_score = _provider_health_scores.get(provider_name, 100)
-    _debug(f"Backing off {provider_name} for {seconds}s (circuit until +{circuit_seconds}s, health={health_score})")
+    with _provider_health_lock:
+        failures = _provider_consecutive_failures.get(provider_name, 0)
+        if exponential and failures > 0:
+            seconds = min(seconds * (2**failures), 3600)
+        now = datetime.datetime.now().timestamp()
+        _provider_backoff_until[provider_name] = now + seconds
+        # circuit_open_until: separate immutable timeout — doesn't reset until cleared by success
+        circuit_seconds = max(seconds, 300)
+        h = _provider_health.setdefault(provider_name, _default_health_entry())
+        h["circuit_open_until"] = now + circuit_seconds
+        h["circuit_open"] = True
+        _provider_health_scores[provider_name] = max(0, _provider_health_scores.get(provider_name, 100) - 20)
+        health_score = _provider_health_scores.get(provider_name, 100)
+        _debug(f"Backing off {provider_name} for {seconds}s (circuit until +{circuit_seconds}s, health={health_score})")
 
 
 def _provider_available(provider_name: str) -> bool:
+    if provider_name in _PROVIDER_RETIRED:
+        return False
     now = datetime.datetime.now().timestamp()
     if now < _provider_backoff_until.get(provider_name, 0):
         return False
@@ -1535,7 +1653,7 @@ def check_providers() -> dict:
     labels = {
         "nemotron_ultra": "NVIDIA Nemotron Ultra (primary, tool-first + final)",
         "gemini": "Gemini 2.5 Flash (fallback, tool calling)",
-        "groq": "Groq llama-3.3-70b (fallback)",
+        "groq": "Groq groq/compound-mini (fallback)",
         "openrouter": "OpenRouter llama-3.1-8b (last-resort)",
         "nvidia_nim": "NVIDIA NIM (fallback tiers)",
         "pollinations": "Pollinations.ai (no-key emergency)",
@@ -3079,6 +3197,10 @@ def _openai_message_get_text(message):
 
 # Providers that require the modern tools/tool_choice format
 _TOOLS_FORMAT_PROVIDERS = {"Groq", "OpenRouter"}
+# Groq gating (Phase 3): groq/compound-mini rejects tool_choice with
+# 400 "tool calling is not supported with this model", so Groq never receives
+# tools unless explicitly opted in via JARVIS_GROQ_TOOLS=1.
+_GROQ_TOOLS_ALLOWED = os.getenv("JARVIS_GROQ_TOOLS", "0") == "1"
 
 
 def _mock_base_url() -> str | None:
@@ -3112,6 +3234,8 @@ def _ask_openai_compatible(
     # Decide which calling format to use
     use_modern_format = provider_name in _TOOLS_FORMAT_PROVIDERS
     enable_tools = not tool_results
+    if provider_name == "Groq" and not _GROQ_TOOLS_ALLOWED:
+        enable_tools = False
 
     # Hard deadline for the whole slot: a stalled model must hand off to the
     # fallback chain instead of eating minutes of API calls (observed 113s on
@@ -3965,6 +4089,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
     global _last_provider_used, _last_model_used, _nemotron_usage_count
 
     ask_start = time.time()
+    _provider_budget_init()
 
     # ── Hybrid routing: local MLX first (simple chat, works offline) ──
     intent_start = time.time()
@@ -4112,6 +4237,9 @@ def _ask_with_tools_impl(user_message: str) -> str:
                         continue
                 except Exception:
                     continue
+                if not _provider_budget_try(_display):
+                    _debug("[Latency] Provider attempt budget exhausted — stopping chain")
+                    break
                 try:
                     _debug(f"[Latency] low-effort primary: {_display}")
                     _last_provider_used = _key
@@ -4143,7 +4271,12 @@ def _ask_with_tools_impl(user_message: str) -> str:
             measurable_inputs={"provider": chosen, "intent": intent, "policy_on": JARVIS_ROUTER_POLICY},
             latency_ms=int((time.time() - provider_select_start) * 1000),
         )
-        if chosen == "nemotron_ultra" and NVIDIA_NEMOTRON_API_KEY and _provider_available("Nemotron Ultra"):
+        if (
+            chosen == "nemotron_ultra"
+            and NVIDIA_NEMOTRON_API_KEY
+            and _provider_available("Nemotron Ultra")
+            and _provider_budget_try("Nemotron Ultra")
+        ):
             log_decision(
                 phase="act",
                 decision="provider_selected",
@@ -4173,7 +4306,8 @@ def _ask_with_tools_impl(user_message: str) -> str:
                 _handle_provider_failure("Nemotron Ultra", e)
         elif JARVIS_ROUTER_POLICY and chosen in _POLICY_PRIMARY_CALLS:
             display, available_fn, ask_fn, model = _POLICY_PRIMARY_CALLS[chosen]
-            if available_fn() and _provider_available(display):
+            if (available_fn() and _provider_available(display)
+                    and _provider_budget_try(display)):
                 log_decision(
                     phase="act",
                     decision="provider_selected",
@@ -4195,7 +4329,9 @@ def _ask_with_tools_impl(user_message: str) -> str:
                     _debug(f"{display} policy-primary failed: {e}")
                     _handle_provider_failure(display, e)
     # Fallback to original provider logic
-    if not _nemotron_attempted and NVIDIA_NEMOTRON_API_KEY and _provider_available("Nemotron Ultra"):
+    if (not _nemotron_attempted and NVIDIA_NEMOTRON_API_KEY
+            and _provider_available("Nemotron Ultra")
+            and _provider_budget_try("Nemotron Ultra")):
         log_decision(
             phase="act",
             decision="provider_selected",
@@ -4237,6 +4373,9 @@ def _ask_with_tools_impl(user_message: str) -> str:
             pname = pp["name"]
             if not _provider_available(pname):
                 continue
+            if not _provider_budget_try(pname):
+                _debug("[Router] Provider attempt budget exhausted — stopping plugin providers")
+                break
             try:
                 log_decision(
                     phase="act",
@@ -4386,6 +4525,9 @@ def _ask_with_tools_impl(user_message: str) -> str:
             measurable_inputs={"provider": provider_name, "health": health},
         )
         _debug(f"Using {provider_name} fallback (health={health})...")
+        if not _provider_budget_try(provider_name):
+            _debug("[Budget] Provider attempt budget exhausted — stopping fallback chain")
+            break
         try:
             reply = _retry(fn, max_retries=2)
             _last_provider_used = provider_name.lower().replace(" ", "_")
@@ -4614,7 +4756,7 @@ def _summarize_with_gemini(history: str) -> str:
     return ""
 
 
-def _summarize_paste(content: str, max_chars: int = 2000) -> str:
+def _summarize_paste(content: str, max_chars: int = 8000) -> str:
     """Summarize pasted content for context preservation.
 
     Uses local LLM (Nemotron/NIM) if available, falls back to extractive summary.
@@ -4919,6 +5061,23 @@ def _process_impl(text, session_id):
         _pre_reflect = conversation_context.snapshot()
         _debug(f"[Reflect] PRE  state={_pre_reflect['state']} last_problem={'yes' if _pre_reflect['last_problem'] else 'no'}")
 
+    # Phase 2: Active Task continuation handling
+    # Check if there's an active task and user is asking to continue
+    _active_task = get_active_task()
+    _is_continuation = is_continuation_request(text)
+    if _active_task and _is_continuation:
+        _debug(f"[Task] Continuation request detected for task {_active_task.task_id[:8]} — resuming")
+        # Inject task context into the message for the agent
+        task_context = _active_task.get_context_for_prompt()
+        text = f"[CONTINUING TASK: {task_context}]\nUser: {text}"
+        t = text.lower()
+        # Force tool_use intent for continuation
+        conversation_context.intent_cache[text] = "tool_use"
+    elif _active_task and not _is_continuation:
+        # User said something else while a task is active - they might be pivoting
+        # We keep the task alive but don't force continuation
+        _debug(f"[Task] Active task {_active_task.task_id[:8]} exists but no continuation request")
+
     # Capability/gap analysis — inject inspect_capabilities result directly
     _capability_gap_patterns = [
         r"\bwhat (should|could|can|do) (i |we |you )?(add|build|create|implement|make)\b",
@@ -4996,11 +5155,14 @@ def _process_impl(text, session_id):
 
             max_iterations = _estimate_task_complexity(text)
             _debug(f"[Complexity] '{text[:50]}' iter={max_iterations} (planner)")
+            # Phase 2: Pass active task to planner if continuing
+            _active_task = get_active_task()
             reply = run_planner_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
                 ask_llm_fn=ask_with_tools,
                 speak_fn=_speak_status,
+                task=_active_task,
             )
         except Exception as e:
             _debug(f"Planner loop failed: {e}, falling back to agent")
@@ -5014,6 +5176,7 @@ def _process_impl(text, session_id):
                     ask_llm_fn=ask_with_tools,
                     speak_fn=_speak_status,
                     max_iterations=max_iterations,
+                    task=_active_task,
                 )
             except Exception as e2:
                 _debug(f"Agent loop failed: {e2}, falling back")
@@ -5030,12 +5193,19 @@ def _process_impl(text, session_id):
 
             max_iterations = _estimate_task_complexity(text)
             _debug(f"[Complexity] '{text[:50]}' iter={max_iterations} (agent)")
+            # Phase 2: Check for active task to continue, or create new one
+            _active_task = get_active_task()
+            if not _active_task:
+                # Create new task for this agent loop
+                _active_task = create_task(goal=text)
+                _debug(f"[Task] Created new task {_active_task.task_id[:8]} for agent loop")
             reply = run_agent_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
                 ask_llm_fn=ask_with_tools,
                 speak_fn=_speak_status,
                 max_iterations=max_iterations,
+                task=_active_task,
             )
         except Exception as e:
             _debug(f"Agent loop failed: {e}, falling back")

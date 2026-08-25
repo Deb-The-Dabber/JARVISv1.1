@@ -12,7 +12,7 @@ HOME = os.path.expanduser("~")
 LEARNED_TOOLS_DIR = os.path.join(HOME, "jarvis_learned_tools")
 os.makedirs(LEARNED_TOOLS_DIR, exist_ok=True)
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = os.environ.get("JARVIS_GROQ_MODEL", "groq/compound-mini")
 OPENROUTER_MODEL = "deepseek/deepseek-v3:free"
 GEMINI_MODEL = "gemini-2.5-flash"
 

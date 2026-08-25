@@ -2,11 +2,17 @@ import datetime
 import os
 import queue
 import re
+import select
 import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+
+try:
+    import termios
+except ImportError:  # non-POSIX platforms
+    termios = None
 from enum import IntEnum
 from typing import Optional
 
@@ -450,6 +456,13 @@ _session_id = os.environ.get("JARVIS_SESSION", "default")
 # unless this is explicitly enabled (and the content has no code fences).
 JARVIS_MULTI_PROBLEM = os.environ.get("JARVIS_MULTI_PROBLEM", "0") == "1"
 
+# Paste batching: lines that arrive together on a TTY (a Cmd+V paste burst)
+# are merged into one message. The settle window extends while a burst is
+# still streaming; normal typing never engages the drain path.
+_PASTE_SETTLE_S = float(os.environ.get("JARVIS_PASTE_SETTLE", "0.3"))
+_PASTE_MAX_CHARS = int(os.environ.get("JARVIS_PASTE_MAX_CHARS", "100000"))
+_PASTE_SUMMARIZE_MIN = 8000
+
 
 # ─────────────────────────────────────────────
 # HANDLE INPUT
@@ -512,6 +525,204 @@ def on_wake_word():
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
+def _stdin_pending() -> bool:
+    """True when complete input is already buffered on stdin (a paste burst)."""
+    try:
+        return bool(select.select([sys.stdin], [], [], 0.0)[0])
+    except (OSError, ValueError):
+        return False
+
+
+# Canonical (ICANON) mode caps a line at 1024 bytes on macOS/BSD ttys and
+# silently discards the excess — a long single-line Cmd+V paste lost its
+# tail before Jarvis ever read it (verified: 3000-char line → 1024 chars).
+# _RawTTYLineReader turns ICANON/ECHO off, assembles lines from raw bytes
+# and echoes/edits them itself, so paste length is bounded only by
+# _PASTE_MAX_CHARS. Set JARVIS_TTY_RAW=0 to fall back to the classic
+# canonical input() path.
+_TTY_RAW = os.environ.get("JARVIS_TTY_RAW", "1") == "1"
+
+
+class _RawTTYLineReader:
+    """Non-canonical line reader with hand-rolled echo/editing.
+
+    Only used on a real TTY (piped stdin keeps the input() path). Handles
+    Enter (\\r and \\n), Backspace/DEL, Ctrl+C (KeyboardInterrupt) and
+    Ctrl+D (EOFError). Multibyte UTF-8 is preserved by buffering raw bytes
+    and decoding at line end.
+    """
+
+    def __init__(self, fd: int):
+        self._fd = fd
+        self._saved: Optional[list] = None
+        self._buf = bytearray()
+        self._pending = b""  # unconsumed tail of the last os.read chunk
+
+    def __enter__(self):
+        if termios is None:
+            return self
+        self._saved = termios.tcgetattr(self._fd)
+        attrs = termios.tcgetattr(self._fd)
+        # lflag (3): canonical off, echo off, signal chars off — we handle
+        # ^C/^D ourselves so long lines are never capped.
+        attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+        termios.tcsetattr(self._fd, termios.TCSANOW, attrs)
+        return self
+
+    def __exit__(self, *exc):
+        if self._saved is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSANOW, self._saved)
+            except (OSError, ValueError):
+                pass
+        return False
+
+    def _echo(self, s: str):
+        try:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _handle_byte(self, b: int) -> Optional[str]:
+        """Process one byte. Returns the completed line, or None if more input needed."""
+        if b in (0x0D, 0x0A):  # Enter (\r or \n)
+            self._echo("\n")
+            line = bytes(self._buf).decode("utf-8", "replace")
+            self._buf.clear()
+            return line
+        if b == 0x03:  # Ctrl+C
+            raise KeyboardInterrupt
+        if b == 0x04:  # Ctrl+D
+            if self._buf:
+                # Flush the partial line like canonical mode does.
+                self._echo("\n")
+                line = bytes(self._buf).decode("utf-8", "replace")
+                self._buf.clear()
+                return line
+            raise EOFError
+        if b in (0x7F, 0x08):  # Backspace / DEL
+            if self._buf:
+                # Walk back over trailing continuation bytes, then include
+                # the lead byte: removes one full UTF-8 codepoint.
+                n = 0
+                while n < len(self._buf) and 0x80 <= self._buf[-n - 1] <= 0xBF:
+                    n += 1
+                if n < len(self._buf):
+                    n += 1
+                del self._buf[-n:]
+                self._echo("\b \b" * n)
+            return None
+        if b < 0x20 and b != 0x09:  # other control bytes: ignore
+            return None
+        self._buf.append(b)
+        raw_out = getattr(sys.stdout, "buffer", None)
+        if raw_out is not None:
+            try:
+                raw_out.write(bytes([b]))
+                raw_out.flush()
+            except (OSError, ValueError):
+                self._echo(chr(b))
+        else:
+            self._echo(chr(b))
+        return None
+
+    def has_pending(self) -> bool:
+        """True when unread bytes remain (kernel buffer or our own tail)."""
+        return bool(self._pending) or _stdin_pending()
+
+    def read_line(self, prompt: str = "") -> str:
+        """Read one line. prompt (if given) is printed before reading."""
+        if prompt:
+            self._echo(prompt)
+        while True:
+            if not self._pending:
+                try:
+                    chunk = os.read(self._fd, 4096)
+                except OSError:
+                    raise EOFError from None
+                if not chunk:
+                    raise EOFError
+            else:
+                chunk = self._pending
+                self._pending = b""
+            for i, b in enumerate(chunk):
+                line = self._handle_byte(b)
+                if line is not None:
+                    # Keep whatever followed the newline for the next read.
+                    self._pending = chunk[i + 1 :]
+                    return line
+
+
+def _drain_burst(first: str, next_line_fn, pending_fn=None) -> tuple[str, bool, bool]:
+    """Join a paste burst onto `first` while lines keep arriving.
+
+    `next_line_fn` returns the next bare line (no prompt) and may raise
+    EOFError at end-of-stream. `pending_fn` (default: kernel-level check)
+    reports whether more input is already buffered. Returns
+    (full_text, is_burst, truncated).
+    """
+    if pending_fn is None:
+        pending_fn = _stdin_pending
+    lines = [first]
+    total = len(first)
+    truncated = False
+    deadline = time.time() + _PASTE_SETTLE_S * (3 if len(lines) >= 3 else 1)
+    while True:
+        if not pending_fn():
+            if time.time() >= deadline:
+                break
+            time.sleep(0.02)
+            continue
+        deadline = time.time() + _PASTE_SETTLE_S * (3 if len(lines) >= 3 else 1)
+        try:
+            line = next_line_fn()
+        except EOFError:
+            break
+        if total + len(line) > _PASTE_MAX_CHARS:
+            truncated = True
+            print(f"  (Paste truncated at {_PASTE_MAX_CHARS} chars.)")
+            break
+        lines.append(line.rstrip())
+        total += len(line)
+    return "\n".join(lines), True, truncated
+
+
+def _read_batched(prompt: str) -> tuple[str, bool, bool]:
+    """Read one message, merging terminal paste bursts into a single unit.
+
+    On a TTY, lines that arrive together (a Cmd+V paste) are joined into one
+    message: the first line carries the prompt, later lines read bare with no
+    prompt spam. Piped stdin (non-tty) reads exactly one line, so scripted
+    input behaves exactly as before.
+
+    On a real TTY the line is read in non-canonical mode (_RawTTYLineReader)
+    so a single line longer than the tty's 1024-byte canonical cap survives
+    whole (JARVIS_TTY_RAW=0 restores the classic canonical input() path).
+
+    Returns (text, is_burst, truncated).
+    """
+    fd = None
+    use_raw = False
+    try:
+        fd = sys.stdin.fileno()
+        use_raw = bool(_TTY_RAW and termios is not None and os.isatty(fd))
+    except (OSError, ValueError, AttributeError):
+        use_raw = False
+
+    if not use_raw:
+        first = input(prompt).rstrip()
+        if not (sys.stdin.isatty() and _stdin_pending()):
+            return first, False, False
+        return _drain_burst(first, lambda: input(""))
+
+    with _RawTTYLineReader(fd) as reader:
+        first = reader.read_line(prompt).rstrip()
+        if not reader.has_pending():
+            return first, False, False
+        return _drain_burst(first, reader.read_line, reader.has_pending)
+
+
 def _sanitize_input(text: str) -> str | None:
     """Return cleaned text or None if too garbled to process."""
     if not text or not text.strip():
@@ -526,6 +737,40 @@ def _sanitize_input(text: str) -> str | None:
         if max_count / len(stripped) > 0.5:
             return None
     return stripped
+
+
+def _is_submit_line(line: str) -> bool:
+    """True when a paste-mode line submits the accumulated buffer."""
+    return line == "/" or line.lower() in ("/go", "go")
+
+
+def _is_cancel_line(line: str) -> bool:
+    """True when a paste-mode line discards the accumulated buffer."""
+    return line.strip().lower() in ("/cancel", "/discard", "cancel", "discard")
+
+
+def _submit_paste_buffer() -> None:
+    """Submit the accumulated paste buffer as exactly one message."""
+    global _paste_buffer
+    if not _paste_buffer:
+        print("  (Nothing pasted yet.)")
+        return
+    full_text = "\n".join(_paste_buffer)
+    _paste_buffer = []
+    if len(full_text) > _PASTE_SUMMARIZE_MIN:
+        print(f"  Summarizing paste ({len(full_text)} chars)...")
+        full_text = _summarize_paste(full_text)
+    user_input = _sanitize_input(full_text)
+    if user_input is None:
+        print("  (Nothing pasted yet.)")
+        return
+    if JARVIS_MULTI_PROBLEM and "```" not in full_text:
+        problems = extract_problems(full_text)
+        if len(problems) >= 2:
+            strategy, selected = prompt_problem_strategy(len(problems))
+            handle_multi_problem(problems, strategy, selected)
+            return
+    handle_input(user_input)
 
 
 def main():
@@ -578,45 +823,56 @@ def main():
             try:
                 _flush_proactive_alerts()
                 _flush_self_test_events()
+                is_burst = False
                 # Mode-specific input handling
                 if _current_mode == InputMode.PASTE:
-                    raw_line = input("Paste → ")
-                    if raw_line.startswith("/"):
-                        raw_input = raw_line.strip()
-                        user_input = _sanitize_input(raw_input)
-                        if user_input is None:
-                            continue
-                    elif raw_line.strip() == "/" or raw_line.strip().lower() in ("/go", "go"):
-                        # Paste terminator: submit accumulated buffer whole.
+                    try:
+                        raw_text, is_burst, _trunc = _read_batched("Paste → ")
+                    except EOFError:
+                        # Ctrl+D: submit what's buffered, then keep going; a
+                        # bare Ctrl+D (nothing buffered) exits as before.
                         if _paste_buffer:
-                            full_text = "\n".join(_paste_buffer)
-                            _paste_buffer = []
-                            # Summarize large pastes to avoid context pollution
-                            if len(full_text) > 2000:
-                                print(f"  Summarizing paste ({len(full_text)} chars)...")
-                                full_text = _summarize_paste(full_text)
-                            user_input = _sanitize_input(full_text)
-                            if user_input is None:
-                                continue
-                            if JARVIS_MULTI_PROBLEM and "```" not in full_text:
-                                problems = extract_problems(full_text)
-                                if len(problems) >= 2:
-                                    strategy, selected = prompt_problem_strategy(len(problems))
-                                    handle_multi_problem(problems, strategy, selected)
-                                    continue
-                        else:
-                            print("  (Nothing pasted yet.)")
+                            _submit_paste_buffer()
                             continue
-                    elif raw_line.strip().lower() in ("/cancel", "/discard", "cancel", "discard"):
+                        raise
+                    except KeyboardInterrupt:
+                        # Ctrl+C: discard the paste, stay in the REPL.
                         _paste_buffer = []
                         print("  Paste discarded.")
                         continue
-                    else:
-                        _paste_buffer.append(raw_line.rstrip())
+                    if is_burst:
+                        # A Cmd+V paste arrives as one burst: buffer it whole.
+                        if raw_text.strip():
+                            _paste_buffer.append(raw_text)
+                            print(
+                                "  Paste buffered "
+                                f"({len(raw_text)} chars, {len(_paste_buffer)} block(s)). "
+                                "Type '/' to submit."
+                            )
                         continue
+                    stripped = raw_text.strip()
+                    if _is_submit_line(stripped):
+                        # Paste terminator: submit accumulated buffer whole.
+                        _submit_paste_buffer()
+                        continue
+                    if _is_cancel_line(stripped):
+                        _paste_buffer = []
+                        print("  Paste discarded.")
+                        continue
+                    # Everything else — including "/"-prefixed lines like code
+                    # comments or file paths — is literal paste content.
+                    _paste_buffer.append(raw_text)
+                    continue
 
                 elif _current_mode == InputMode.QUEUE:
-                    raw_line = input("Queue → ").strip()
+                    raw_text, is_burst, _trunc = _read_batched("Queue → ")
+                    if is_burst:
+                        # A Cmd+V paste enqueues as one item, not N lines.
+                        if raw_text.strip():
+                            _queue_buffer.append(raw_text)
+                            print(f"  Queued ({len(_queue_buffer)}). Type 'go' to execute.")
+                        continue
+                    raw_line = raw_text.strip()
                     if raw_line.startswith("/"):
                         raw_input = raw_line
                         user_input = _sanitize_input(raw_input)
@@ -650,8 +906,8 @@ def main():
                         continue
 
                 else:
-                    raw_input = input("You → ").strip()
-                    user_input = _sanitize_input(raw_input)
+                    raw_text, is_burst, _trunc = _read_batched("You → ")
+                    user_input = _sanitize_input(raw_text)
                     if user_input is None:
                         continue
 
@@ -668,7 +924,7 @@ def main():
                 else:
                     print("  Didn't catch that.\n")
 
-            elif handle_local_command(user_input):
+            elif (not is_burst or "\n" not in user_input) and handle_local_command(user_input):
                 continue
 
             else:
@@ -1198,7 +1454,7 @@ def _handle_slash_slash(cmd: str):
         if not full_text:
             print("  Clipboard is empty.")
             return
-        if len(full_text) > 2000:
+        if len(full_text) > _PASTE_SUMMARIZE_MIN:
             print(f"  Summarizing paste ({len(full_text)} chars)...")
             full_text = _summarize_paste(full_text)
         print(f"  Submitting clipboard ({len(full_text)} chars) as one message.")

@@ -162,3 +162,60 @@ class TestMockProviderControl:
             "Pollinations",
         ]:
             assert p in state, f"Missing provider: {p}"
+
+
+class TestProviderRetirement:
+    """Phase 3: 401/402/403 permanently retires a provider until it succeeds."""
+
+    def test_402_retires_provider_and_chain_still_succeeds(self, mock_provider, mock_api):
+        """Gemini 402s -> retired; the chain answers via Groq and never re-hits Gemini."""
+        mock_provider.reset()
+        mock_provider.fail("Gemini", mode="402", duration=120)
+        r = mock_api.ask("weather in tokyo")
+        assert r.status_code == 200
+        assert len(r.json()["reply"]) > 0
+        called = mock_provider.called_providers
+        assert "Groq" in called
+
+    def test_retired_provider_not_re_attempted(self, mock_provider, mock_api):
+        """After a 402 retirement, later requests skip the provider entirely."""
+        mock_provider.reset()
+        mock_provider.fail("Gemini", mode="402", duration=120)
+        r1 = mock_api.ask("weather", timeout=120)
+        assert r1.status_code == 200
+        calls_after_r1 = mock_provider.state()["Gemini"]["call_count"]
+        assert calls_after_r1 >= 1
+
+        r2 = mock_api.ask("weather again", timeout=120)
+        assert r2.status_code == 200
+        calls_after_r2 = mock_provider.state()["Gemini"]["call_count"]
+        # The 402 (payment wall) retired Gemini on request 1 — request 2 must
+        # skip it without re-hitting, so the mock call count is frozen.
+        assert calls_after_r2 == calls_after_r1, "Retired provider was re-attempted"
+
+
+class TestProviderBudget:
+    """Phase 3: per-request provider attempt budget caps chain burn."""
+
+    def test_attempt_budget_caps_chain(self, monkeypatch, mock_provider, mock_api):
+        monkeypatch.setenv("JARVIS_PROVIDER_REQUEST_BUDGET", "3")
+        mock_provider.reset()
+        for p in [
+            "Nemotron Ultra",
+            "DeepSeek",
+            "Gemini",
+            "Groq",
+            "Kimi K2",
+            "NVIDIA NIM",
+            "OpenRouter",
+            "Pollinations",
+        ]:
+            mock_provider.fail(p, mode="500", duration=120)
+        r = mock_api.ask("weather", timeout=120)
+        assert r.status_code == 200
+        state = mock_provider.state()
+        # With budget 3: Gemini, Groq, NIM Fast are attempted (and fail); the
+        # chain must stop before NIM Coding / OpenRouter / Pollinations.
+        assert state["OpenRouter"]["call_count"] == 0, "Budget did not cap OpenRouter"
+        assert state["Pollinations"]["call_count"] == 0, "Budget did not cap Pollinations"
+        assert state["Groq"]["call_count"] >= 1
