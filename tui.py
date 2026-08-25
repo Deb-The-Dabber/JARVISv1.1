@@ -272,25 +272,13 @@ class Composer(TextArea):
 # ARTIFICIAL RETINA (read-only reference to the experiment)
 # ──────────────────────────────────────────────────────────
 def load_artificial_retina():
-    """Load ArtificialRetina from jarvis_vision_experiment WITHOUT executing
-    the module (it opens the camera and runs an infinite loop at import).
-
-    The experiment folder is a scratch area (Jarvis self-test) that can be
-    mid-edit — any parse/extract error returns None; callers degrade to
-    "retina unavailable" instead of crashing the Vision tab."""
+    """Load ArtificialRetina from tools.vision_retina (absorbed from jarvis_vision_experiment)."""
     try:
-        path = Path(__file__).parent / "jarvis_vision_experiment" / "vision.py"
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ArtificialRetina")
-        mod = ast.Module(body=[cls], type_ignores=[])
-        ast.fix_missing_locations(mod)
-        import cv2
-        import numpy as np
-
-        ns = {"cv2": cv2, "np": np}
-        exec(compile(mod, str(path), "exec"), ns)  # noqa: S102 — trusted local source
-        return ns["ArtificialRetina"]
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('vision_retina', 'tools/vision_retina.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.ArtificialRetina
     except Exception:
         return None
 
