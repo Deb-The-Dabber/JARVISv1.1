@@ -128,6 +128,25 @@ if __name__ == "__main__":
         ],
     )
 
+    # ── Test 3: Paste mode submits one message whole ──
+    # The multi-line paste must reach the scheduler as ONE request whose echo
+    # contains the full text (blank lines kept) — never as N fragments.
+    run_test(
+        "Paste mode — one message per paste",
+        [
+            "/mode p",
+            "line one",
+            "line two",
+            "",
+            "line four",
+            "/",
+        ],
+        expected_patterns=[
+            r"#\d+ FOREGROUND",
+            r"You → line one\nline two\n\nline four",
+        ],
+    )
+
     # ── Test 4: Web search ──
     run_test(
         "Web search with query",

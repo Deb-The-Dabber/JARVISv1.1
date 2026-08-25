@@ -13,3 +13,21 @@ node_modules/
 *.ckpt
 *.pt
 .jsf_pids
+
+# Regeneratable benchmark outputs
+benchmarks/results/gate_bench_*.json
+benchmarks/results/gate_bench_summary.json
+benchmarks/results/regression_gate_*.json
+benchmarks/results/latest_regression.json
+benchmarks/results/latest.json
+benchmarks/results/smoke_*.json
+
+# Runtime logs
+parsers/*.jsonl
+*.log
+
+# Generated docs
+COMMANDS.md
+
+# Local configs
+.opencode/
