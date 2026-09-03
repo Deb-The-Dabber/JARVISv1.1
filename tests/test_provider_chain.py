@@ -70,21 +70,21 @@ class TestRetirement:
 class TestProviderBudget:
     def test_budget_init_and_exhaustion(self, monkeypatch, tmp_path):
         b = _brain(monkeypatch, tmp_path)
-        assert b._provider_budget_init() == 6
+        budget = b.ProviderBudget(max_attempts=6)
         for _ in range(6):
-            assert b._provider_budget_try("X")
-        assert b._provider_budget_left() == 0
-        assert b._provider_budget_try("X") is False
+            assert budget.try_reserve("X")
+        assert budget.remaining() == 0
+        assert budget.try_reserve("X") is False
 
     def test_budget_resets_per_request(self, monkeypatch, tmp_path):
         b = _brain(monkeypatch, tmp_path)
-        b._provider_budget_init()
+        budget1 = b.ProviderBudget(max_attempts=6)
         for _ in range(6):
-            b._provider_budget_try("X")
-        assert b._provider_budget_left() == 0
-        b._provider_budget_init()
-        assert b._provider_budget_left() == 6
-        assert b._provider_budget_try("X") is True
+            budget1.try_reserve("X")
+        assert budget1.remaining() == 0
+        budget2 = b.ProviderBudget(max_attempts=6)
+        assert budget2.remaining() == 6
+        assert budget2.try_reserve("X") is True
 
 
 class TestProviderHealthConcurrency:

@@ -559,9 +559,8 @@ _PROVIDER_HEALTH_META_RETIRED = "__retired__"
 # ── Phase 3: per-request provider attempt budget ──
 # Total provider-slot attempts allowed per ask_with_tools request. A derailed
 # chain can no longer burn every provider (and its retries) on one message.
-# Reset at the top of each request (thread-local).
+# Reset at the top of each request (via ProviderBudget instance).
 JARVIS_PROVIDER_REQUEST_BUDGET = float(os.getenv("JARVIS_PROVIDER_REQUEST_BUDGET", "6"))
-_request_budget = threading.local()
 
 # ── Phase 3: provider health concurrency protection ──
 # Protects all mutations to provider health globals:
@@ -570,29 +569,30 @@ _request_budget = threading.local()
 _provider_health_lock = threading.RLock()
 
 
-def _provider_budget_init() -> int:
-    try:
-        budget = int(JARVIS_PROVIDER_REQUEST_BUDGET)
-    except (TypeError, ValueError):
-        budget = 6
-    _request_budget.remaining = max(1, budget)
-    return _request_budget.remaining
+class ProviderBudget:
+    """Single authoritative budget for all provider attempts in one request."""
+    def __init__(self, max_attempts: int = 6):
+        self.max_attempts = max_attempts
+        self.attempts = 0
+        self.per_provider: dict[str, int] = {}
+    
+    def try_reserve(self, provider: str) -> bool:
+        if self.attempts >= self.max_attempts:
+            _debug(f"[Budget] Provider attempt budget exhausted ({self.max_attempts}) — skipping {provider}")
+            return False
+        self.attempts += 1
+        self.per_provider[provider] = self.per_provider.get(provider, 0) + 1
+        return True
+    
+    def remaining(self) -> int:
+        return max(0, self.max_attempts - self.attempts)
 
 
-def _provider_budget_try(provider_name: str) -> bool:
-    """Reserve one provider attempt if any budget remains for this request."""
-    remaining = getattr(_request_budget, "remaining", 0)
-    if remaining <= 0:
-        _debug(f"[Budget] Provider attempt budget exhausted — skipping {provider_name}")
-        return False
-    if remaining == 1:
-        _debug("[Budget] Final provider attempt in this request")
-    _request_budget.remaining = remaining - 1
-    return True
-
-
-def _provider_budget_left() -> int:
-    return getattr(_request_budget, "remaining", 0)
+# ── Phase 3: provider health concurrency protection ──
+# Protects all mutations to provider health globals:
+# _provider_consecutive_failures, _provider_backoff_until, _PROVIDER_RETIRED,
+# _provider_health_scores, _provider_usage_count, _provider_health
+_provider_health_lock = threading.RLock()
 
 
 def _retire_provider(provider_name: str, reason: str):
@@ -4090,7 +4090,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
     global _last_provider_used, _last_model_used, _nemotron_usage_count
 
     ask_start = time.time()
-    _provider_budget_init()
+    budget = ProviderBudget(max_attempts=int(JARVIS_PROVIDER_REQUEST_BUDGET))
 
     # ── Hybrid routing: local MLX first (simple chat, works offline) ──
     intent_start = time.time()
@@ -4238,7 +4238,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
                         continue
                 except Exception:
                     continue
-                if not _provider_budget_try(_display):
+                if not budget.try_reserve(_display):
                     _debug("[Latency] Provider attempt budget exhausted — stopping chain")
                     break
                 try:
@@ -4276,7 +4276,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
             chosen == "nemotron_ultra"
             and NVIDIA_NEMOTRON_API_KEY
             and _provider_available("Nemotron Ultra")
-            and _provider_budget_try("Nemotron Ultra")
+            and budget.try_reserve("Nemotron Ultra")
         ):
             log_decision(
                 phase="act",
@@ -4308,7 +4308,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
         elif JARVIS_ROUTER_POLICY and chosen in _POLICY_PRIMARY_CALLS:
             display, available_fn, ask_fn, model = _POLICY_PRIMARY_CALLS[chosen]
             if (available_fn() and _provider_available(display)
-                    and _provider_budget_try(display)):
+                    and budget.try_reserve(display)):
                 log_decision(
                     phase="act",
                     decision="provider_selected",
@@ -4332,7 +4332,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
     # Fallback to original provider logic
     if (not _nemotron_attempted and NVIDIA_NEMOTRON_API_KEY
             and _provider_available("Nemotron Ultra")
-            and _provider_budget_try("Nemotron Ultra")):
+            and budget.try_reserve("Nemotron Ultra")):
         log_decision(
             phase="act",
             decision="provider_selected",
@@ -4374,7 +4374,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
             pname = pp["name"]
             if not _provider_available(pname):
                 continue
-            if not _provider_budget_try(pname):
+            if not budget.try_reserve(pname):
                 _debug("[Router] Provider attempt budget exhausted — stopping plugin providers")
                 break
             try:
@@ -4526,7 +4526,7 @@ def _ask_with_tools_impl(user_message: str) -> str:
             measurable_inputs={"provider": provider_name, "health": health},
         )
         _debug(f"Using {provider_name} fallback (health={health})...")
-        if not _provider_budget_try(provider_name):
+        if not budget.try_reserve(provider_name):
             _debug("[Budget] Provider attempt budget exhausted — stopping fallback chain")
             break
         try:
