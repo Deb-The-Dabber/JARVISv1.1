@@ -4086,6 +4086,148 @@ def ask_with_tools(user_message: str) -> str:
         return _ask_with_tools_impl(user_message)
 
 
+def _dispatch_fallback_chain(prompt: str, tool_results: list, intent: str,
+                              budget: ProviderBudget, skip_provider: str | None = None) -> str:
+    """Shared fallback chain for user path and planner path.
+    
+    Args:
+        prompt: The user message or planner prompt
+        tool_results: List of tool results for context (empty for planner path)
+        intent: Intent tag for logging ("user" or "planner")
+        budget: ProviderBudget instance shared across all stages
+        skip_provider: Provider name to skip (e.g., planner primary that already failed).
+                       Prevents wasting budget on a near-certain repeat failure.
+    """
+    raw_providers = [
+        ("Gemini", _gemini_available() and _provider_available("Gemini"), lambda: ask_gemini(prompt, tool_results)),
+        ("Groq", bool(GROQ_API_KEY), lambda: ask_groq(prompt, tool_results)),
+        ("NIM Fast", bool(NVIDIA_NEMOTRON_API_KEY), lambda: ask_nim_fast(prompt, tool_results)),
+        ("NIM Coding", bool(NVIDIA_NEMOTRON_API_KEY), lambda: ask_nim_coding(prompt, tool_results)),
+        ("OpenRouter", bool(OPENROUTER_API_KEY), lambda: ask_openrouter(prompt, tool_results)),
+        ("Pollinations", True, lambda: ask_pollinations(prompt, tool_results)),
+    ]
+
+    available = [(n, a, f, _provider_health_scores.get(n, 100)) for n, a, f in raw_providers if a]
+    available.sort(key=lambda x: x[3], reverse=True)
+
+    log_decision(
+        phase="act",
+        decision="fallback_chain_prepared",
+        decision_source="health_sorted_providers",
+        measurable_inputs={"providers": [(n, h) for n, _, _, h in available]},
+    )
+
+    _failed_providers = []
+    for provider_name, _is_available, fn, health in available:
+        if provider_name == skip_provider:
+            _debug(f"Skipping {provider_name} (already attempted as planner primary)")
+            continue
+        if not _provider_available(provider_name):
+            log_decision(
+                phase="act",
+                decision="provider_skipped",
+                decision_source="_provider_available",
+                measurable_inputs={"provider": provider_name, "reason": "backoff/disabled"},
+                outcome="skipped",
+            )
+            _debug(f"Skipping {provider_name} (backoff/disabled)")
+            continue
+        if health < 30:
+            log_decision(
+                phase="act",
+                decision="provider_skipped",
+                decision_source="health_threshold",
+                measurable_inputs={"provider": provider_name, "health": health},
+                outcome="skipped",
+            )
+            _debug(f"Skipping {provider_name} (low health: {health})")
+            continue
+        log_decision(
+            phase="act",
+            decision="fallback_provider_attempted",
+            decision_source="health_sorted_fallback",
+            measurable_inputs={"provider": provider_name, "health": health},
+        )
+        _debug(f"Using {provider_name} fallback (health={health})...")
+        if not budget.try_reserve(provider_name):
+            _debug("[Budget] Provider attempt budget exhausted — stopping fallback chain")
+            break
+        try:
+            reply = _retry(fn, max_retries=2)
+            _last_provider_used = provider_name.lower().replace(" ", "_")
+            _record_provider_success(provider_name)
+            log_decision(
+                phase="act",
+                decision="fallback_provider_succeeded",
+                decision_source=provider_name,
+                measurable_inputs={"provider": provider_name},
+                outcome="success",
+                latency_ms=0,
+            )
+            return reply
+        except Exception as e:
+            log_decision(
+                phase="act",
+                decision="fallback_provider_failed",
+                decision_source=provider_name,
+                measurable_inputs={"provider": provider_name, "error": str(e)},
+                outcome="failure",
+            )
+            _debug(f"{provider_name} fallback failed: {e}")
+            _handle_provider_failure(provider_name, e)
+            _failed_providers.append(f"{provider_name}: {e}")
+
+    # Last resort: on-device NN provider (never raises, works fully offline)
+    if not JARVIS_MOCK_PROVIDERS:
+        try:
+            log_decision(
+                phase="act",
+                decision="local_nn_attempted",
+                decision_source="_local_intent_predict",
+                measurable_inputs={},
+            )
+            _local_offline_intent, _local_offline_conf = _local_intent_predict(prompt)
+            reply = ask_local_offline(prompt, tool_results)
+            _last_provider_used = "local_nn"
+            log_decision(
+                phase="act",
+                decision="local_nn_succeeded",
+                decision_source="ask_local_offline",
+                measurable_inputs={"intent": _local_offline_intent, "confidence": _local_offline_conf},
+                outcome="success",
+            )
+            _debug(f"[Local NN] Offline reply (intent={_local_offline_intent}, conf={_local_offline_conf:.2f})")
+            return reply
+        except Exception as e:
+            log_decision(
+                phase="act",
+                decision="local_nn_failed",
+                decision_source="ask_local_offline",
+                measurable_inputs={"error": str(e)},
+                outcome="failure",
+            )
+            _debug(f"[Local NN] Offline provider failed: {e}")
+
+    if _failed_providers:
+        log_decision(
+            phase="act",
+            decision="all_providers_failed",
+            decision_source="fallback_chain_exhausted",
+            measurable_inputs={"failed_providers": _failed_providers, "count": len(_failed_providers)},
+            outcome="failure",
+        )
+        details = "; ".join(_failed_providers)
+        return f"All configured AI providers are currently unavailable. Provider errors: {details}. Please try again shortly."
+    log_decision(
+        phase="act",
+        decision="all_providers_unavailable",
+        decision_source="no_available_providers",
+        measurable_inputs={},
+        outcome="failure",
+    )
+    return "All configured AI providers are currently unavailable. Please try again shortly."
+
+
 def _ask_with_tools_impl(user_message: str) -> str:
     global _last_provider_used, _last_model_used, _nemotron_usage_count
 
@@ -4448,161 +4590,8 @@ def _ask_with_tools_impl(user_message: str) -> str:
     else:
         _debug("No accumulated tool results from primary provider")
 
-    # Sort providers by health score descending for intelligent fallback
-    _provider_health_scores.setdefault("Gemini", 100)
-    _provider_health_scores.setdefault("Groq", 100)
-    _provider_health_scores.setdefault("NIM Fast", 100)
-    _provider_health_scores.setdefault("NIM Coding", 100)
-    _provider_health_scores.setdefault("OpenRouter", 100)
-    _provider_health_scores.setdefault("Pollinations", 100)
-
-    raw_providers = [
-        ("Gemini", _gemini_available() and _provider_available("Gemini"), lambda: ask_gemini(user_message)),
-        ("Groq", bool(GROQ_API_KEY), lambda: ask_groq(user_message, combined_results)),
-        ("NIM Fast", bool(NVIDIA_NEMOTRON_API_KEY), lambda: ask_nim_fast(user_message, combined_results)),
-        ("NIM Coding", bool(NVIDIA_NEMOTRON_API_KEY), lambda: ask_nim_coding(user_message, combined_results)),
-        ("OpenRouter", bool(OPENROUTER_API_KEY), lambda: ask_openrouter(user_message, combined_results)),
-        ("Pollinations", True, lambda: ask_pollinations(user_message, combined_results)),
-    ]
-
-    # Filter available, then sort: policy ordering (2A.3) or health descending
-    available = [(n, a, f, _provider_health_scores.get(n, 100)) for n, a, f in raw_providers if a]
-    if JARVIS_ROUTER_POLICY:
-        try:
-            from routing_policy import score_candidates
-
-            policy_cands = [
-                {
-                    "provider": _PROVIDER_KEY_BY_DISPLAY.get(n, n),
-                    "health": h,
-                    "latency_ms": _observed_latency_ms(n),
-                    "available": True,
-                }
-                for n, _a, _f, h in available
-            ]
-            ordered = score_candidates(intent, policy_cands)
-            rank = {e["provider"]: i for i, e in enumerate(ordered)}
-            available.sort(key=lambda x: rank.get(_PROVIDER_KEY_BY_DISPLAY.get(x[0], x[0]), 999))
-            _log_policy_decision(intent, ordered)
-        except Exception as e:
-            _debug(f"[Router] policy fallback ordering failed, health sort: {e}")
-            available.sort(key=lambda x: x[3], reverse=True)
-    else:
-        available.sort(key=lambda x: x[3], reverse=True)
-
-    log_decision(
-        phase="act",
-        decision="fallback_chain_prepared",
-        decision_source="routing_policy" if JARVIS_ROUTER_POLICY else "health_sorted_providers",
-        measurable_inputs={"providers": [(n, h) for n, _, _, h in available]},
-    )
-
-    _failed_providers = []
-    for provider_name, _is_available, fn, health in available:
-        if not _provider_available(provider_name):
-            log_decision(
-                phase="act",
-                decision="provider_skipped",
-                decision_source="_provider_available",
-                measurable_inputs={"provider": provider_name, "reason": "backoff/disabled"},
-                outcome="skipped",
-            )
-            _debug(f"Skipping {provider_name} (backoff/disabled)")
-            continue
-        if health < 30:
-            log_decision(
-                phase="act",
-                decision="provider_skipped",
-                decision_source="health_threshold",
-                measurable_inputs={"provider": provider_name, "health": health},
-                outcome="skipped",
-            )
-            _debug(f"Skipping {provider_name} (low health: {health})")
-            continue
-        log_decision(
-            phase="act",
-            decision="fallback_provider_attempted",
-            decision_source="health_sorted_fallback",
-            measurable_inputs={"provider": provider_name, "health": health},
-        )
-        _debug(f"Using {provider_name} fallback (health={health})...")
-        if not budget.try_reserve(provider_name):
-            _debug("[Budget] Provider attempt budget exhausted — stopping fallback chain")
-            break
-        try:
-            reply = _retry(fn, max_retries=2)
-            _last_provider_used = provider_name.lower().replace(" ", "_")
-            _record_provider_success(provider_name)
-            log_decision(
-                phase="act",
-                decision="fallback_provider_succeeded",
-                decision_source=provider_name,
-                measurable_inputs={"provider": provider_name},
-                outcome="success",
-                latency_ms=0,
-            )
-            return reply
-        except Exception as e:
-            log_decision(
-                phase="act",
-                decision="fallback_provider_failed",
-                decision_source=provider_name,
-                measurable_inputs={"provider": provider_name, "error": str(e)},
-                outcome="failure",
-            )
-            _debug(f"{provider_name} fallback failed: {e}")
-            _handle_provider_failure(provider_name, e)
-            _failed_providers.append(f"{provider_name}: {e}")
-
-    # ── Last resort: on-device NN provider (never raises, works fully offline) ──
-    if not JARVIS_MOCK_PROVIDERS:
-        try:
-            log_decision(
-                phase="act",
-                decision="local_nn_attempted",
-                decision_source="_local_intent_predict",
-                measurable_inputs={},
-            )
-            _local_offline_intent, _local_offline_conf = _local_intent_predict(user_message)
-            reply = ask_local_offline(user_message, combined_results)
-            _last_provider_used = "local_nn"
-            log_decision(
-                phase="act",
-                decision="local_nn_succeeded",
-                decision_source="ask_local_offline",
-                measurable_inputs={"intent": _local_offline_intent, "confidence": _local_offline_conf},
-                outcome="success",
-            )
-            _debug(f"[Local NN] Offline reply (intent={_local_offline_intent}, conf={_local_offline_conf:.2f})")
-            return reply
-        except Exception as e:
-            log_decision(
-                phase="act",
-                decision="local_nn_failed",
-                decision_source="ask_local_offline",
-                measurable_inputs={"error": str(e)},
-                outcome="failure",
-            )
-            _debug(f"[Local NN] Offline provider failed: {e}")
-
-    if _failed_providers:
-        log_decision(
-            phase="act",
-            decision="all_providers_failed",
-            decision_source="fallback_chain_exhausted",
-            measurable_inputs={"failed_providers": _failed_providers, "count": len(_failed_providers)},
-            outcome="failure",
-        )
-        details = "; ".join(_failed_providers)
-        return f"All configured AI providers are currently unavailable. Provider errors: {details}. Please try again shortly."
-    log_decision(
-        phase="act",
-        decision="all_providers_unavailable",
-        decision_source="no_available_providers",
-        measurable_inputs={},
-        outcome="failure",
-    )
-    return "All configured AI providers are currently unavailable. Please try again shortly."
+    # Use shared fallback chain helper
+    return _dispatch_fallback_chain(user_message, combined_results, intent, budget, skip_provider=None)
 
 
 def get_nemotron_usage_count() -> int:
