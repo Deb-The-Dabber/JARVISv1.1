@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -198,7 +199,40 @@ def _advance_phase(current: str, requested: str) -> str:
         return PHASE_EXPLORE
     return _PHASE_ORDER[max(cur, _PHASE_ORDER.index(requested))]
 
+
+def _validate_phase_transition(current: str, requested: str) -> bool:
+    """Validate that a phase transition is allowed.
+    
+    Only allows: EXPLORE -> PLAN -> IMPLEMENT (monotonic forward).
+    Returns True if transition is valid, False otherwise.
+    """
+    if requested not in _PHASE_ORDER:
+        return False
+    try:
+        cur_idx = _PHASE_ORDER.index(current)
+        req_idx = _PHASE_ORDER.index(requested)
+    except ValueError:
+        return False
+    # Only allow forward transitions or staying in same phase
+    return req_idx >= cur_idx
+
 # ── Think → Act → Evaluate: Plan dataclasses ──
+
+
+def _stable_step_id(goal: str, tool_hint: str, args: dict) -> str:
+    """Generate a stable, deterministic step ID from step semantics.
+    
+    Uses content-addressing so the same logical step produces the same ID
+    across planner regenerations, retries, and process restarts.
+    """
+    # Normalize args to sorted, canonical representation
+    args_canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    # Normalize goal and tool hint
+    goal_norm = re.sub(r"\s+", " ", goal.strip().lower())
+    tool_norm = tool_hint.strip().lower()
+    # Create stable hash from semantic content
+    content = f"{goal_norm}|{tool_norm}|{args_canonical}"
+    return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -359,7 +393,14 @@ def _step_from_dict(s: dict) -> PlanStep | None:
     clean = {k: v for k, v in s.items() if k in {"step_id", "goal", "tool_hint", "args", "status", "result", "evaluation"}}
     if not isinstance(clean.get("args"), dict):
         clean["args"] = {}
-    clean.setdefault("step_id", str(len(clean) + 1))
+    # Generate stable step_id from step semantics if not provided or if it's a sequential number
+    provided_id = clean.get("step_id")
+    if not provided_id or (isinstance(provided_id, str) and provided_id.isdigit()):
+        clean["step_id"] = _stable_step_id(
+            clean.get("goal", ""),
+            clean.get("tool_hint", ""),
+            clean.get("args", {})
+        )
     clean.setdefault("goal", "")
     clean.setdefault("tool_hint", "")
     clean.setdefault("status", "pending")
@@ -587,7 +628,6 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task
                 "thought": step.goal,
             }
             task.record_step(step_data, step.tool_hint, step.args)
-            task.phase = TaskPhase.IMPLEMENT  # planner is in implement phase
             task.save()
 
     # Synthesize final answer
@@ -1344,8 +1384,8 @@ def run_agent_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, max_it
         # Phase 2: Record step to active task for cross-turn persistence
         if task:
             task.record_step(step_data, tool_name, args, verified=verified)
-            # Sync task phase with agent phase
-            task.phase = phase
+            # Sync task phase with agent phase via validated transition
+            task.phase = _advance_phase(task.phase, phase)
             task.next_action = decision.get("thought", "")[:200]
             task.save()
 

@@ -78,8 +78,8 @@ class TestStepFromDict:
         assert s.status == "pending"
 
     def test_extra_fields_dropped(self):
-        s = _step_from_dict({"step_id": "2", "explanation": "irrelevant", "args": {"query": "q"}})
-        assert s.step_id == "2"
+        s = _step_from_dict({"step_id": "custom_step_2", "explanation": "irrelevant", "args": {"query": "q"}})
+        assert s.step_id == "custom_step_2"
         assert s.args == {"query": "q"}
 
     def test_non_dict_arg_coerced(self):

@@ -3,6 +3,7 @@ Phase 5: Goal criteria and verification support.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -746,6 +747,11 @@ class ActiveTask:
         """
         step_data["timestamp"] = datetime.datetime.now().isoformat()
         step_data["phase"] = self.phase
+        # Add step_id if not present (for stable identity)
+        if "step_id" not in step_data:
+            step_data["step_id"] = hashlib.sha256(
+                f"{step_data.get('tool','')}|{step_data.get('thought','')}|{json.dumps(step_data.get('args',{}), sort_keys=True)}".encode()
+            ).hexdigest()[:12]
         # Track verified vs tool success
         step_data["verified"] = verified
         self.completed_steps.append(step_data)
@@ -1019,6 +1025,53 @@ class ActiveTask:
                      f"Recoveries {budget['recoveries']}/{budget['recovery_budget']}, "
                      f"Time {budget['time_spent_seconds']}/{budget['time_budget_seconds']}s")
         return "\n".join(lines)
+
+    def get_compact_planner_context(self) -> str:
+        """Generate compact task context for planner (~500 tokens).
+        
+        Provides only the essential state needed for planning:
+        - Goal, phase, completed steps, constraints, budget, next action
+        Excludes conversation history, provider prompts, duplicated tool results.
+        """
+        completed_summary = ", ".join(
+            f"{s.get('tool','?')} {'✓' if s.get('success') else '✗'}"
+            for s in self.completed_steps[-5:]
+        ) if self.completed_steps else "(none)"
+        
+        failed_tools = [s.get("tool","?") for s in self.completed_steps if not s.get("success")]
+        
+        criteria_summary = ", ".join(
+            f"{c.get('type','?')}:{c.get('target','?')}"
+            for c in self.goal_criteria
+        ) if self.goal_criteria else "(none)"
+        
+        budget = self.execution_budget
+        
+        return (
+            f"Task: {self.goal}\n"
+            f"Phase: {self.phase}\n"
+            f"Completed: {len(self.completed_steps)} steps ({completed_summary})\n"
+            f"Failed: {failed_tools if failed_tools else '(none)'}\n"
+            f"Constraints: {criteria_summary}\n"
+            f"Budget: LLM {budget['llm_calls']}/{budget['llm_budget']}, "
+            f"Tools {budget['tool_calls']}/{budget['tool_budget']}\n"
+            f"Next: {self.next_action or '(none)'}"
+        )
+
+    def _validate_phase_transition(self, requested: str) -> bool:
+        """Validate that a phase transition is allowed.
+        
+        Only allows: EXPLORE -> PLAN -> IMPLEMENT (monotonic forward).
+        """
+        _PHASE_ORDER = (TaskPhase.EXPLORE, TaskPhase.PLAN, TaskPhase.IMPLEMENT)
+        if requested not in _PHASE_ORDER:
+            return False
+        try:
+            cur_idx = _PHASE_ORDER.index(self.phase)
+            req_idx = _PHASE_ORDER.index(requested)
+        except ValueError:
+            return False
+        return req_idx >= cur_idx
 
 
 def get_active_task() -> Optional[ActiveTask]:

@@ -393,6 +393,19 @@ async def chat_completions(request: Request):
         raise
 
 
+@app.get("/v1beta/models/{model}")
+async def gemini_get_model(model: str):
+    """Mock endpoint for gemini client models.get() warmup call."""
+    return {
+        "name": f"models/{model}",
+        "displayName": model,
+        "description": f"Mock model {model}",
+        "supportedGenerationMethods": ["generateContent"],
+        "inputTokenLimit": 1048576,
+        "outputTokenLimit": 8192,
+    }
+
+
 @app.post("/v1beta/models/{model}:generateContent")
 async def gemini_generate(model: str, request: Request):
     body = await request.json()

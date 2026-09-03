@@ -8,352 +8,356 @@
   "total_cases": 30,
   "errors": 0,
   "error_rows": [],
-  "correct": 28,
-  "incorrect": 2,
-  "accuracy": 0.9333,
-  "local_nn_accepted": 11,
-  "local_nn_correct_accepts": 11,
+  "correct": 23,
+  "incorrect": 7,
+  "accuracy": 0.7667,
+  "local_nn_accepted": 0,
+  "local_nn_correct_accepts": 0,
   "local_nn_incorrect_accepts": 0,
-  "escalations": 19,
-  "escalation_rate": 0.6333,
-  "llm_classify_calls_saved": 11,
+  "cheap_routed": 0,
+  "routed_without_llm": 0,
+  "escalations": 30,
+  "escalation_rate": 1.0,
+  "llm_classify_calls_saved": 0,
   "escalation_paths": {
-    "keyword": 1,
-    "nemotron": 18
+    "keyword": 30
   },
+  "cheap_calls": 0,
+  "cheap_errors": 0,
+  "total_latency_ms": 21.0,
+  "mean_latency_ms": 0.7,
+  "mean_latency_accept_ms": 0,
+  "mean_latency_escalation_ms": 0.7,
   "per_case": [
     {
       "prompt": "My Python script crashes with 'IndexError: list index out of range' when parsing a CSV that has empty rows. Can you help me fix the parsing loop?",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.9
     },
     {
       "prompt": "Why does this async function hang forever? asyncio.gather gives no results and the event loop never exits cleanly.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "My regex r'<a.*?>' on HTML grabs everything from the first opening tag to the last closing tag. What is the correct lazy quantifier to make it stop at the first match per line?",
       "expected": "coding",
-      "got": "coding",
-      "path": "nemotron",
+      "got": "tool_use",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": false,
+      "latency_ms": 1.9
     },
     {
       "prompt": "A Flask endpoint returns 500 with 'Object of type Decimal is not JSON serializable'. How do I fix the serialization?",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.538,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.12592061331761956
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "This while loop pegs the CPU at 100% even when the list is nearly empty. Is the exit condition wrong, and how should I rewrite it?",
       "expected": "coding",
-      "got": "coding",
-      "path": "nemotron",
+      "got": "tool_use",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": false,
+      "latency_ms": 0.5
     },
     {
       "prompt": "git merge reports CONFLICT on files I never touched. Can you explain what happened and the cleanest way to resolve it?",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.1
     },
     {
       "prompt": "Write a Python function that computes the Levenshtein distance between two strings using a DP table.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.836,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.13849602622178056
-      },
-      "fine_actual": null,
-      "correct": true
-    },
-    {
-      "prompt": "Write a Python snippet that flattens a nested list of arbitrary depth.",
-      "expected": "coding",
-      "got": "cad",
       "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": false
+      "correct": true,
+      "latency_ms": 0.2
+    },
+    {
+      "prompt": "Write a Python snippet that flattens a nested list of arbitrary depth.",
+      "expected": "coding",
+      "got": "coding",
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
+      "fine_actual": null,
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Write a script that finds duplicate files by content hash in a given directory.",
       "expected": "coding",
-      "got": "coding",
-      "path": "nemotron",
+      "got": "tool_use",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": false,
+      "latency_ms": 0.1
     },
     {
       "prompt": "Write a Python class implementing a simple LRU cache that is thread-safe.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.517,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.11856863526138291
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.1
     },
     {
       "prompt": "Implement retry-with-backoff logic for a network call: retry 3 times with exponential backoff plus jitter.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Add progress bar support to a CLI tool using tqdm: show percent, ETA, and transfer rate.",
       "expected": "coding",
-      "got": "coding",
-      "path": "nemotron",
+      "got": "tool_use",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": false,
+      "latency_ms": 3.3
     },
     {
       "prompt": "Write a bash one-liner to rename all .JPG files to lowercase .jpg in the current folder.",
       "expected": "coding",
-      "got": "coding",
-      "path": "nemotron",
+      "got": "chat",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": false,
+      "latency_ms": 0.7
     },
     {
       "prompt": "Write a Python script that watches a directory and logs newly created files.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 5.9
     },
     {
       "prompt": "Write a Python script to convert a JSON file with nested objects into a flattened CSV with dotted keys.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Explain what this Python snippet does and give a full example: sorted(items, key=lambda x: x[1]).",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.535,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.16113551795197653
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Walk me through how Python's GIL affects threading performance for CPU-bound vs IO-bound code.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.514,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.1250332851166047
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.1
     },
     {
       "prompt": "Explain what a context manager is and why 'with open(...)' is preferred over manual close().",
       "expected": "coding",
-      "got": "reasoning",
-      "path": "nemotron",
+      "got": "tool_use",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": false
+      "correct": false,
+      "latency_ms": 0.5
     },
     {
       "prompt": "Refactor this function to avoid O(n^2) behavior: it builds a list with '+=' inside a loop.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.527,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.15946450973826318
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.1
     },
     {
       "prompt": "How can I make this nested if-else chain more readable? Propose a dict-dispatch refactor.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.1
     },
     {
       "prompt": "Optimize code that reads a large JSON file line by line but builds a giant in-memory dict \u2014 suggest streaming or preprocessing.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Review this function for bugs and edge cases: it slices a list without any bounds checks.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.858,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.13997531339757968
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.6
     },
     {
       "prompt": "Port this JavaScript arrow-function map/filter chain to idiomatic Python.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.716,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.18085455882562368
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.3
     },
     {
       "prompt": "Translate this Python script to a TypeScript equivalent using async/await.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Design a REST API for a URL shortener: list the endpoints, status codes, and request/response shapes.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.1
     },
     {
       "prompt": "Design the endpoints for a file upload service with resumable uploads.",
       "expected": "coding",
       "got": "coding",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.3
     },
     {
       "prompt": "Write a README section that explains installation and quickstart for a CLI tool.",
       "expected": "coding",
-      "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.715,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.175915949358044
-      },
+      "got": "tool_use",
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": false,
+      "latency_ms": 0.3
     },
     {
       "prompt": "Give me a .gitignore for a Python project with a venv, __pycache__, and .env files.",
       "expected": "coding",
       "got": "coding",
-      "path": "local_nn",
-      "confidence": 0.676,
-      "raw": {
-        "fine": null,
-        "fine_conf": 0.16099529649552088
-      },
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 2.9
     },
     {
       "prompt": "I need to choose between microservices and a monolith for a small team's new product. Compare the tradeoffs and give a recommendation.",
       "expected": "reasoning",
       "got": "reasoning",
-      "path": "nemotron",
+      "path": "keyword",
       "confidence": null,
       "raw": null,
       "fine_actual": null,
-      "correct": true
+      "correct": true,
+      "latency_ms": 0.2
     },
     {
       "prompt": "Hi! What can you help me with today? Give me a quick summary of your abilities.",
       "expected": "chat",
       "got": "chat",
-      "path": "local_nn",
-      "confidence": 0.971,
-      "raw": {
-        "fine": "ask_capabilities",
-        "fine_conf": 0.33422378251130935
-      },
-      "fine_actual": "ask_capabilities",
-      "correct": true
+      "path": "keyword",
+      "confidence": null,
+      "raw": null,
+      "fine_actual": null,
+      "correct": true,
+      "latency_ms": 0.2
     }
   ]
 }

@@ -1704,7 +1704,7 @@ def _gemini_available() -> bool:
     try:
         from google import genai  # noqa: F401
 
-        return bool(GEMINI_API_KEY)
+        return bool(GEMINI_API_KEY) and _get_gemini_usage_count() < GEMINI_DAILY_LIMIT
     except ImportError:
         return False
 
@@ -1776,7 +1776,8 @@ def init():
     _get_client()
     _load_provider_health()
     check_providers()
-    warm_up_providers()
+    if not JARVIS_MOCK_PROVIDERS:
+        warm_up_providers()
     # Phase 1.2: Pre-warm MiniLM embedding model in background
     import threading as _t
 
@@ -2924,9 +2925,9 @@ def _ask_gemini_with_model(user_message: str, model_name: str) -> str:
 
     tool_results = []
     for _ in range(GEMINI_MAX_TOOL_ROUNDS):
-        # Track daily Gemini usage and enforce limit (hard stop at limit - 2).
+        # Track daily Gemini usage and enforce limit (hard stop at limit).
         usage = _increment_gemini_usage()
-        if usage >= GEMINI_DAILY_LIMIT - 1:
+        if usage >= GEMINI_DAILY_LIMIT:
             tomorrow = datetime.date.today() + datetime.timedelta(days=1)
             midnight_ts = datetime.datetime.combine(tomorrow, datetime.time.min).timestamp()
             global _gemini_backoff_until
@@ -3005,7 +3006,7 @@ def ask_gemini_tools_only(user_message: str) -> list[str]:
     results = []
     for _ in range(3):
         usage = _increment_gemini_usage()
-        if usage > 20:
+        if usage >= GEMINI_DAILY_LIMIT:
             tomorrow = datetime.date.today() + datetime.timedelta(days=1)
             midnight_ts = datetime.datetime.combine(tomorrow, datetime.time.min).timestamp()
             global _gemini_backoff_until
@@ -3881,7 +3882,7 @@ Always prefer real tool results over assumptions."""
 
     for _ in range(GEMINI_MAX_TOOL_ROUNDS):
         usage = _increment_gemini_usage()
-        if usage >= GEMINI_DAILY_LIMIT - 2:
+        if usage >= GEMINI_DAILY_LIMIT:
             tomorrow = datetime.date.today() + datetime.timedelta(days=1)
             midnight_ts = datetime.datetime.combine(tomorrow, datetime.time.min).timestamp()
             global _gemini_backoff_until
@@ -4732,7 +4733,7 @@ def _summarize_with_gemini(history: str) -> str:
     This helper is only used for background memory summarization and should
     not consume Gemini quota aggressively when the key is precious.
     """
-    if not _gemini_available() or datetime.datetime.now().timestamp() < _gemini_backoff_until or _get_gemini_usage_count() >= GEMINI_DAILY_LIMIT - 2:
+    if not _gemini_available() or datetime.datetime.now().timestamp() < _gemini_backoff_until:
         return ""
     client = _get_client()
     if not client:
@@ -4741,7 +4742,7 @@ def _summarize_with_gemini(history: str) -> str:
     for model_name in GEMINI_MODELS:
         try:
             usage = _increment_gemini_usage()
-            if usage >= GEMINI_DAILY_LIMIT - 2:
+            if usage >= GEMINI_DAILY_LIMIT:
                 return ""
             response = client.models.generate_content(
                 model=model_name,
