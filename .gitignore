@@ -31,3 +31,7 @@ COMMANDS.md
 
 # Local configs
 .opencode/
+
+# Test/generated artifacts
+Desktop/
+jarvis_vector_db/
