@@ -10,12 +10,12 @@ pytestmark = pytest.mark.integration
 class TestProviderFallbackChain:
     """Verify the provider fallback chain behaves correctly.
 
-    NOTE: since Phase 2A the default (non-policy) chain in brain.py is
-    Gemini -> Groq -> NIM Fast -> NIM Coding -> OpenRouter -> Pollinations;
-    Nemotron Ultra is only a primary in policy (JARVIS_ROUTER_POLICY=1) or
-    LLM-first (JARVIS_LLM_FIRST=1) mode, so the mock-mode fallback tests
-    exercise Groq (the first provider whose OpenAI-compatible path records
-    attempts on the mock).
+    NOTE: the repo .env ships JARVIS_LATENCY_POLICY=1, so tool-y requests
+    like "weather in tokyo" route through the low-effort candidate chain
+    (scored by latency_policy/EFFORT_WEIGHTS["low"]), whose deterministic
+    order is Gemini -> NIM Fast -> Groq. When Gemini fails, NIM Fast answers
+    (its head model is deepseek-v4-flash, which the mock buckets as
+    "DeepSeek"). These tests exercise that real fallback behaviour.
     """
 
     def test_default_chain_success(self, mock_provider, mock_api):
@@ -26,8 +26,14 @@ class TestProviderFallbackChain:
         data = r.json()
         assert "reply" in data
 
-    def test_fallback_to_groq_on_gemini_failure(self, mock_provider, mock_api):
-        """When Gemini fails (500), fall through to Groq."""
+    def test_fallback_to_nim_fast_on_gemini_failure(self, mock_provider, mock_api):
+        """When Gemini fails (500), the low-effort chain falls to NIM Fast.
+
+        NIM Fast's head model (deepseek-v4-flash) is bucketed "DeepSeek" by
+        the mock's model-name heuristic. Asserting "Groq" here was previously
+        satisfied only because the retired llama-based NIM Fast head happened
+        to match the mock's historical "llama" -> "Groq" rule.
+        """
         mock_provider.reset()
         mock_provider.fail("Gemini", mode="500", duration=60)
         r = mock_api.ask("weather in tokyo")
@@ -35,7 +41,7 @@ class TestProviderFallbackChain:
         data = r.json()
         assert "reply" in data
         called = mock_provider.called_providers
-        assert "Groq" in called
+        assert "DeepSeek" in called
 
     def test_all_providers_fail_graceful_error(self, mock_provider, mock_api):
         """When all providers fail, user gets a graceful error, not a crash."""
@@ -85,9 +91,11 @@ class TestProviderHealthScoring:
         initial = mock_provider.health("Groq")
         assert initial["health_score"] == 100
 
-        # Gemini (chain head) must fail too, or it answers and Groq is never
-        # attempted — the Gemini mock path doesn't record failed attempts.
+        # Gemini (chain head) and NIM Fast (second in the low-effort chain,
+        # bucketed "DeepSeek") must fail too, or the chain answers before
+        # Groq (third) is ever attempted.
         mock_provider.fail("Gemini", mode="500", duration=60)
+        mock_provider.fail("DeepSeek", mode="500", duration=60)
         mock_provider.fail("Groq", mode="500", duration=60)
         r = mock_api.ask("weather", timeout=60)
         assert r.status_code == 200
@@ -168,14 +176,14 @@ class TestProviderRetirement:
     """Phase 3: 401/402/403 permanently retires a provider until it succeeds."""
 
     def test_402_retires_provider_and_chain_still_succeeds(self, mock_provider, mock_api):
-        """Gemini 402s -> retired; the chain answers via Groq and never re-hits Gemini."""
+        """Gemini 402s -> retired; the chain answers via NIM Fast and never re-hits Gemini."""
         mock_provider.reset()
         mock_provider.fail("Gemini", mode="402", duration=120)
         r = mock_api.ask("weather in tokyo")
         assert r.status_code == 200
         assert len(r.json()["reply"]) > 0
         called = mock_provider.called_providers
-        assert "Groq" in called
+        assert "DeepSeek" in called
 
     def test_retired_provider_not_re_attempted(self, mock_provider, mock_api):
         """After a 402 retirement, later requests skip the provider entirely."""

@@ -67,6 +67,8 @@ def _model_to_provider(model: str) -> str:
         return "DeepSeek"
     if "kimi" in m:
         return "Kimi K2"
+    if "groq/" in m or "compound-mini" in m:
+        return "Groq"
     if "llama" in m:
         return "Groq"
     if "gemini" in m:

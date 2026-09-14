@@ -1216,35 +1216,22 @@ class TestPhaseOwnership:
         continued = continue_task()
         assert continued.phase == TaskPhase.EXPLORE, f"Phase changed to {continued.phase}"
 
-    def test_planner_never_mutates_task_phase(self, monkeypatch):
+    def test_planner_never_mutates_task_phase(self):
         """Planner must not directly mutate task.phase."""
-        import brain
-        from brain import run_planner_loop_with_plan
+        import agent
         from task import ActiveTask, TaskPhase
-        from unittest.mock import MagicMock
-        
-        # Mock generate_plan to return a plan without calling real LLM
-        def mock_generate_plan(context, goal):
-            from agent import Plan, PlanStep
-            step = PlanStep(step_id="test_step", goal="Test step", tool_hint="read_file", args={"path": "test.py"})
-            return Plan(plan_id="test", original_goal=goal, steps=[step])
-        
-        monkeypatch.setattr(brain, "generate_plan", mock_generate_plan)
-        
-        task = ActiveTask(task_id='test_planner_phase', goal='Test task', phase=TaskPhase.EXPLORE)
-        
-        plan = brain.generate_plan("Task context", "Test goal")
+
+        def mock_ask_llm(prompt):
+            return ('[{"step_id": "1", "goal": "Test step", '
+                    '"tool_hint": "read_file", "args": {"path": "test.py"}}]')
+
+        task = ActiveTask(task_id="test_planner_phase", goal="Test goal", phase=TaskPhase.EXPLORE)
+        original_phase = task.phase
+
+        plan = agent._create_plan("Test goal", mock_ask_llm)
         assert plan is not None
-        
-        mock_execute = MagicMock(return_value="result")
-        
-        def ask_llm(prompt):
-            if "evaluator" in prompt.lower() or "succeeded" in prompt.lower():
-                return "SUCCESS - step completed"
-            return '{"tool": "test_tool", "args": {}}'
-        
-        brain.run_planner_loop_with_plan(plan, lambda t, a: "result", ask_llm)
-        assert True
+        assert len(plan.steps) == 1
+        assert task.phase == original_phase
 
     def test_no_premature_implementation(self):
         """EXPLORE phase task must not execute mutation tools."""
@@ -1281,21 +1268,18 @@ class TestPhaseOwnership:
 class TestPlannerIsolation:
     """Test that planner works correctly."""
 
-    def test_planner_works_without_crashing(self, monkeypatch):
-        """Planner should work without crashing."""
-        import brain
-        
-        # Mock generate_plan to return a plan without calling real LLM
-        def mock_generate_plan(context, goal):
-            from agent import Plan, PlanStep
-            step = PlanStep(step_id="test_step", goal="Test step", tool_hint="read_file", args={"path": "test.py"})
-            return Plan(plan_id="test", original_goal=goal, steps=[step])
-        
-        monkeypatch.setattr(brain, "generate_plan", mock_generate_plan)
-        
-        plan = brain.generate_plan("Task context", "Test goal")
+    def test_planner_works_without_crashing(self):
+        """Planner should build a valid Plan without crashing."""
+        import agent
+
+        def mock_ask_llm(prompt):
+            return ('[{"step_id": "1", "goal": "Test step", '
+                    '"tool_hint": "read_file", "args": {"path": "test.py"}}]')
+
+        plan = agent._create_plan("Test goal", mock_ask_llm)
         assert plan is not None
         assert len(plan.steps) > 0
+        assert all(s.tool_hint for s in plan.steps)
 
     def test_planner_output_validation(self):
         from agent import _extract_json_array, _step_from_dict
@@ -1326,38 +1310,310 @@ class TestProviderFailureIsolation:
         assert task.phase == original_phase
 
 
-class TestResumeIdempotency:
-    @pytest.mark.skip(reason="Phase 2 — persistent Plan/ExecutionRecord model, out of scope for Phase 1")
-    def test_resume_unfinished_work(self):
-        from brain import generate_plan, run_planner_loop_with_plan
-        from task import ActiveTask, TaskPhase
-        from unittest.mock import MagicMock
-        
-        task = ActiveTask(task_id='test_resume', goal='Test task', phase=TaskPhase.EXPLORE)
-        task.record_step({"tool": "read_file", "args": {"path": "a.py"}, "success": True, "result": "ok", "thought": "read a"}, "read_file", {"path": "a.py"})
-        task.record_step({"tool": "read_file", "args": {"path": "b.py"}, "success": True, "result": "ok", "thought": "read b"}, "read_file", {"path": "b.py"})
-        task.save()
-        
-        plan = generate_plan(task.get_compact_planner_context(), "Continue exploration")
-        
-        if plan:
-            last_step_id = plan.steps[1].step_id if len(plan.steps) > 1 else None
-            
-            mock_execute = MagicMock(return_value="result")
-            def ask_llm(prompt):
-                if "evaluator" in prompt.lower():
-                    return "SUCCESS - step completed"
-                return '{"tool": "test", "args": {}}'
-            
-            result = run_planner_loop_with_plan(
-                plan, 
-                lambda t, a: "result", 
-                lambda p: "SUCCESS - step completed",
-                task=None,
-                resume_from_step_id=last_step_id
+class TestDeadModelExclusion:
+    """Issue 7: confirmed-EOL models must never appear in executable routing."""
+
+    DEAD_MODELS = [
+        "minimaxai/minimax-m3",
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "nvidia/nemotron-3-nano-30b-a3b",
+        "stepfun-ai/step-3.7-flash",
+    ]
+
+    def test_dead_models_removed_from_nim_slots(self):
+        import brain
+        for rota in (brain.NIM_MODEL_FAST, brain.NIM_MODEL_CODING, brain.NIM_MODEL_FRONTIER):
+            for dead in self.DEAD_MODELS:
+                assert dead not in rota, f"{dead} still in NIM slot"
+
+    def test_dead_models_removed_from_context_limits(self):
+        from config import MODEL_CONTEXT_LIMITS
+        for dead in self.DEAD_MODELS:
+            assert dead not in MODEL_CONTEXT_LIMITS, (
+                f"{dead} still in MODEL_CONTEXT_LIMITS (context-limits table is config, not routing, "
+                "but stale EOL entries here mislead future contributors and the agent's own introspection)"
             )
-            
-            assert True
+
+
+class TestProviderEOLClassification:
+    """Issue 8/7: 410/EOL errors must classify as permanent (immediate retirement),
+    not as recoverable — otherwise a retired model burns retry budget forever."""
+
+    def test_410_is_permanent(self, monkeypatch, tmp_path):
+        import brain
+        assert brain._classify_error("Error code: 410 Gone") == "permanent"
+        assert brain._classify_error("The model 'x' has reached its end of life") == "permanent"
+        assert brain._classify_error("model is no longer available") == "permanent"
+
+
+class TestToolContract:
+    """A regression guard so a planner-generated alias like file_path never
+    crashes a tool call when the contract wants `path`.
+
+    Evidence (live session, Sep 11): planner emitted
+        {"tool": "read_file", "args": {"file_path": "/path/to/file"}}
+    and the validator returned
+        'ERROR: Missing required argument(s) for read_file: path'
+    """
+
+    def test_alias_normalization_maps_file_path_to_path(self, monkeypatch):
+        import brain
+        validated = brain.validate_tool_args("read_file", {"file_path": "/tmp/x.py"})
+        assert not isinstance(validated, str), f"validation rejected: {validated}"
+        name, args = validated
+        assert args["path"] == "/tmp/x.py"
+
+    def test_alias_normalization_idempotent_and_never_overrides_canonical(self, monkeypatch):
+        import brain
+        # If both keys are present, the canonical path wins; alias never overwrites.
+        validated = brain.validate_tool_args(
+            "read_file", {"path": "/canonical", "file_path": "/alias"}
+        )
+        name, args = validated
+        assert args["path"] == "/canonical"
+
+    def test_execute_tool_path_accepts_alias_input(self, monkeypatch):
+        """Full pipeline: _execute_tool with aliased args executes without the
+        'Missing required argument' string being returned."""
+        import brain
+        out = brain._execute_tool("read_file", {"file_path": "/nonexistent/file.py"})
+        assert "Missing required argument" not in out
+
+
+class TestPythonContract:
+    """Issue 6: the contract-side grounding for model-generated Python."""
+
+    def test_malformed_python_syntax_rejected_pre_execution(self):
+        """'import subprocess, subprocess.run(...)' — observed in live demo — must
+        fail fast with a clear message instead of reaching the sandbox"""
+        from tools.code_tools import run_python
+
+        out = run_python('import subprocess, subprocess.run(["ls"])')
+        assert "Syntax error" in out, out
+
+    def test_valid_python_runs(self):
+        from tools.code_tools import run_python
+
+        out = run_python('print("hello")')
+        assert "hello" in out
+
+
+class TestRecoveryLoopBounded:
+    """Issue 2 follow-on: recovery suggestions are bounded per plan, not just
+    deduped — a stubborn replanner can't ask for new alternatives forever."""
+
+    def test_recovery_stop_after_per_step_cap(self):
+        import agent
+
+        calls = []
+        given = []
+
+        def fake_execute(tool, args):
+            calls.append((tool, args))
+            return f"executed {tool}"
+
+        # A step always fails evaluation; a recovery ask always comes back with a
+        # different tool — we keep allowing it until the plan-wide counter stops it.
+        answer_sequence = iter(
+            ["FAILURE",  # evaluation of the step
+             '{"tool": "t2", "args": {"a": 2}}',  # recovery asks for a different tool
+             ]
+        )
+
+        def fake_ask(prompt):
+            return next(answer_sequence)
+
+        from agent import Plan, PlanStep, run_planner_loop_with_plan
+        plan = Plan(plan_id="p_forever", original_goal="g",
+                    steps=[
+                        PlanStep(step_id="s1", goal="one", tool_hint="t1", args={"a": 1}),
+                        PlanStep(step_id="s2", goal="two", tool_hint="t2", args={"a": 2}),
+                    ])
+        run_planner_loop_with_plan(plan=plan, execute_tool_fn=fake_execute, ask_llm_fn=fake_ask)
+        # The second step's recovery is allowed (different sig), but the FIRST
+        # planner-side recovery produced a result already recorded; confirm both
+        # were counted exactly once (no looping identical recovery calls).
+        assert len([c for c in calls if c[0] == "t2"]) == 1
+
+
+class TestConfirmationSemantics:
+    """Issue 5: a run_python preview that stops at NeedsConfirmation must be
+    recorded as awaiting_confirmation, not as a project failure."""
+
+    CONFIRM_TEXT = (
+        "Preview of run python shown above. "
+        "Say yes to run it for real OUTSIDE the sandbox, or no to cancel."
+    )
+
+    def test_preview_result_is_not_misjudged_by_evaluator(self):
+        from agent import Plan, PlanStep, run_planner_loop_with_plan
+
+        asks = []
+
+        def fake_execute(tool, args):
+            return self.CONFIRM_TEXT  # simulates sandbox NeedsConfirmation path
+
+        def fake_ask(prompt):
+            asks.append(prompt)
+            return "FAILURE — preview pending"
+
+        plan = Plan(
+            plan_id="pending-confirm",
+            original_goal="run a thing",
+            steps=[PlanStep(step_id="s1", goal="run it", tool_hint="run_python", args={"code": "print(1)"})],
+        )
+        run_planner_loop_with_plan(plan=plan, execute_tool_fn=fake_execute, ask_llm_fn=fake_ask)
+        s = plan.steps[0]
+        assert s.status == "awaiting_confirmation", f"step status was {s.status!r}"
+        assert s.evaluation == "pending"
+        # The evaluator must NOT receive this preview as an outcome — no ask
+        # about it should have been made (eval would just misread preview text).
+        assert not any("step evaluator" in p for p in asks), asks
+
+    def test_awaiting_confirmation_skips_recovery_replan(self):
+        from agent import Plan, PlanStep, run_planner_loop_with_plan
+
+        asks = []
+
+        def fake_execute(tool, args):
+            return self.CONFIRM_TEXT
+
+        def fake_ask(prompt):
+            asks.append(prompt)
+            return "FAILURE"
+
+        plan = Plan(plan_id="pending-confirm-2", original_goal="run a thing",
+                    steps=[PlanStep(step_id="s1", goal="run", tool_hint="run_python", args={"code": "print(1)"})])
+        run_planner_loop_with_plan(plan=plan, execute_tool_fn=fake_execute, ask_llm_fn=fake_ask)
+        # no retry/replan prompt was issued for the pending-confirmation step
+        assert not any("Suggest an alternative approach or tool" in p for p in asks)
+
+
+class TestRecoveryDedup:
+    """Issue 2: per-plan recovery-call dedup must stop identical repeat executions."""
+
+    def test_recovery_suggestion_duplicate_does_not_reexecute(self):
+        """If evaluation fails then the recovery ask re-suggests the SAME
+        (tool, args) pair that just failed (or that already succeeded), the
+        planner must reuse the recorded result instead of re-executing."""
+        from agent import Plan, PlanStep, run_planner_loop_with_plan
+
+        calls = []
+
+        def fake_execute(tool, args):
+            calls.append((tool, args.get("path")))
+            return "some-observable-result"
+
+        # ask_llm is invoked for: step evaluation, then the retry/recovery ask
+        answers = iter([
+            "FAILURE — first call failed",  # evaluation -> failure
+            '{"tool": "read_file", "args": {"path": "same.txt"}, "reason": "retry"}',  # identical suggestion
+        ])
+
+        def fake_ask(prompt):
+            return next(answers)
+
+        plan = Plan(
+            plan_id="p_dedup",
+            original_goal="read same.txt",
+            steps=[PlanStep(step_id="s1", goal="read", tool_hint="read_file", args={"path": "same.txt"})],
+        )
+        run_planner_loop_with_plan(plan=plan, execute_tool_fn=fake_execute, ask_llm_fn=fake_ask)
+        # First executed the step; retry produced identical signature → no second execution.
+        assert len(calls) == 1, f"identical recovery suggestion re-executed: {calls}"
+
+
+class TestPlannerContractInjection:
+    def test_resume_unfinished_work(self, monkeypatch, tmp_path):
+        """Resume executes from the matching list position, not ID ordering.
+
+        True restart test: plan is persisted, in-memory reference discarded,
+        then reconstructed from persistence by plan_id.
+        """
+        from agent import Plan, PlanStep, plan_from_persistence, run_planner_loop_with_plan
+        import plans
+
+        monkeypatch.setattr(plans, "DB_PATH", str(tmp_path / "plans.db"))
+        plans.init_db()
+
+        # Create and persist plan via production persistence path
+        plan_id = "resume-plan-restart"
+        plans.save_plan(
+            plan_id=plan_id,
+            original_goal="Resume exact remaining work",
+            status="running",
+            current_step=0,
+        )
+        # Persist steps with explicit step_index (trap: IDs disagree with order)
+        plans.save_plan_step(
+            step_id="z-before", plan_id=plan_id, step_index=0,
+            goal="already completed", tool_hint="before_tool", args={"step": "before"},
+            status="completed", result="done", evaluation="success",
+        )
+        plans.save_plan_step(
+            step_id="a-resume", plan_id=plan_id, step_index=1,
+            goal="resume here", tool_hint="resume_tool", args={"step": "resume"},
+            status="pending", result="", evaluation="",
+        )
+        plans.save_plan_step(
+            step_id="m-after", plan_id=plan_id, step_index=2,
+            goal="finish later", tool_hint="after_tool", args={"step": "after"},
+            status="pending", result="", evaluation="",
+        )
+
+        # Discard in-memory reference (simulate process restart)
+        original_plan_ref = None  # no in-memory Plan object retained
+
+        # Reconstruct via production reconstruction path
+        reloaded_plan = plan_from_persistence(plan_id)
+        assert reloaded_plan is not None, "reconstruction returned None"
+        assert reloaded_plan.plan_id == plan_id
+        assert reloaded_plan.original_goal == "Resume exact remaining work"
+        assert len(reloaded_plan.steps) == 3
+        # Steps ordered by step_index: z-before(0), a-resume(1), m-after(2)
+        assert reloaded_plan.steps[0].step_id == "z-before"
+        assert reloaded_plan.steps[1].step_id == "a-resume"
+        assert reloaded_plan.steps[2].step_id == "m-after"
+        # Verify it's a fresh object, not the original (which we never created in-memory)
+        assert original_plan_ref is None  # nothing to compare; construction was from DB
+
+        executed = []
+        attempts_before_execution = []
+
+        def execute(tool, args):
+            records = plans.load_execution_records_for_plan(plan_id)
+            attempts_before_execution.append(records[-1])
+            executed.append((tool, args["step"]))
+            return f"{args['step']} completed"
+
+        def ask_llm(prompt):
+            if "step evaluator" in prompt.lower():
+                return "SUCCESS"
+            return "Plan complete"
+
+        # True restart path: caller has only plan_id
+        run_planner_loop_with_plan(
+            plan_id=plan_id,
+            execute_tool_fn=execute,
+            ask_llm_fn=ask_llm,
+            resume_from_step_id="a-resume",
+        )
+
+        # z-before (index 0) skipped; a-resume (index 1) runs; m-after (index 2) runs
+        assert executed == [("resume_tool", "resume"), ("after_tool", "after")]
+        assert [record["step_id"] for record in attempts_before_execution] == [
+            "a-resume",
+            "m-after",
+        ]
+        assert all(record["success"] is False for record in attempts_before_execution)
+        assert all(record["result"] == "" for record in attempts_before_execution)
+
+        records = plans.load_execution_records_for_plan(plan_id)
+        assert [record["step_id"] for record in records] == ["a-resume", "m-after"]
+        assert all(record["success"] is True for record in records)
+        assert plans.load_plan_step(plan_id, "z-before")["status"] == "completed"
+        assert plans.load_plan_step(plan_id, "a-resume")["status"] == "completed"
+        assert plans.load_plan_step(plan_id, "m-after")["status"] == "completed"
 
 
 class TestDuplicateExecutionProtection:
