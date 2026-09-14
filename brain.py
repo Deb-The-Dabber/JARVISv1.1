@@ -12,7 +12,13 @@ from dotenv import load_dotenv
 import action_sandbox
 import file_sandbox
 import learner
-from agent import needs_agent_loop, needs_planner, run_agent_loop, run_planner_loop
+from agent import (
+    needs_agent_loop,
+    needs_planner,
+    run_agent_loop,
+    run_planner_loop,
+    run_planner_loop_with_plan as _run_planner_loop_with_plan,
+)
 from config import (
     GEMINI_DAILY_LIMIT,
     MODEL_CONTEXT_LIMITS,
@@ -124,20 +130,22 @@ def _daily_budget_exceeded() -> tuple[bool, float, float]:
 GEMINI_TOOL_MODEL = "gemini-2.5-flash"
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
 # NIM slot ladder (2C): functional slots replace the legacy numeric tiers.
-# All models verified live on build.nvidia.com free endpoints (2026-08-13).
+# Verified live against the NIM catalog on 2026-09-12. All four legacy slots
+# (llama-3.3-nemotron-super-49b-v1.5, nemotron-3-nano-30b-a3b,
+# step-3.7-flash, minimax-m3) returned 410/EOL — removed from routing.
 NIM_MODEL_FAST = [
-    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-    "nvidia/nemotron-3-nano-30b-a3b",
-    "stepfun-ai/step-3.7-flash",
+    "deepseek-ai/deepseek-v4-flash-0731",   # verified 0.3s ping
+    "openai/gpt-oss-20b",                     # verified 0.7s
+    "nvidia/nemotron-3-super-120b-a12b",     # verified 1.7s
 ]
 NIM_MODEL_CODING = [
-    "minimaxai/minimax-m3",
-    "openai/gpt-oss-20b",
-    "deepseek-ai/deepseek-v4-flash-0731",
+    "deepseek-ai/deepseek-v4-flash-0731",   # verified 0.3s
+    "deepseek-ai/deepseek-v4-pro-0813",     # verified 30.5s (strong, slow)
+    "openai/gpt-oss-20b",                   # verified 0.7s
 ]
 NIM_MODEL_FRONTIER = [
     "nvidia/nemotron-3-ultra-550b-a55b",
-    "minimaxai/minimax-m3",
+    "deepseek-ai/deepseek-v4-pro-0813",     # strongest verified live model
 ]
 # Defined but NOT registered as an active routing slot: the E4 probe must
 # prove reliable (<10s) latency first (2026-08-13 probe: 21.7s for 1 token).
@@ -149,6 +157,14 @@ GROQ_MODEL = _env("JARVIS_GROQ_MODEL") or "groq/compound-mini"
 OPENROUTER_MODEL = _env("OPENROUTER_MODEL") or "meta-llama/llama-3.1-8b-instruct"
 POLLINATIONS_MODEL = "openai"
 NEMOTRON_ULTRA_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+# OmniRoute: local OpenAI-compatible gateway (default localhost:20128). JARVIS
+# keeps owning provider-slot selection/retry; OmniRoute owns upstream routing
+# when the OmniRoute slot is used (JARVIS sends the auto-router alias, not a
+# specific upstream model). Enabled only when OMNIROUTE_API_KEY is set, so
+# direct-provider operation is unchanged when it isn't configured.
+OMNIROUTE_BASE_URL = os.getenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1").rstrip("/")
+OMNIROUTE_API_KEY = _env("OMNIROUTE_API_KEY")
+OMNIROUTE_MODEL = _env("OMNIROUTE_MODEL") or "auto"
 
 
 USER_NAME = "Debasish"
@@ -452,6 +468,14 @@ def _classify_error(error_text: str) -> str | None:
     if ("402" in err or "payment required" in err or "insufficient credits" in err
             or "no credits" in err or "billing" in err or "accounts have insufficient balance" in err):
         return "permanent"
+    # 410 Gone / end-of-life markers: the model is retired upstream, so retrying
+    # forever in this session (per-provider retry budget) is guaranteed dead.
+    # Treat as permanent so _handle_provider_failure retires the slot and the
+    # fallback chain skips it immediately, rather than spending NIM retries
+    # before discovering the same 410 again (observed Jun 2026 session log).
+    if ("410" in err or "gone" in err or "end of life" in err or "no longer available" in err
+            or "has been retired" in err or "eol" in err):
+        return "permanent"
     if "401" in err or "403" in err or "unauthorized" in err or "invalid api key" in err:
         return "auth_error"
     if "permission denied" in err or "forbidden" in err:
@@ -690,6 +714,29 @@ class ConversationContext:
 
 
 conversation_context = ConversationContext()
+
+
+def run_planner_loop_with_plan(
+    plan=None,
+    execute_tool_fn=None,
+    ask_llm_fn=None,
+    speak_fn=None,
+    task=None,
+    resume_from_step_id: str | None = None,
+    plan_id: str | None = None,
+) -> str:
+    """Execute a supplied plan, resuming at a specific persisted step if asked.
+    Provide either plan (in-memory) or plan_id (persisted).
+    """
+    return _run_planner_loop_with_plan(
+        plan,
+        execute_tool_fn,
+        ask_llm_fn,
+        speak_fn=speak_fn,
+        task=task,
+        resume_from_step_id=resume_from_step_id,
+        plan_id=plan_id,
+    )
 
 
 from task import (
@@ -2446,11 +2493,51 @@ def infer_tool_from_args(parsed: dict, user_message: str = "") -> tuple | None:
     return None
 
 
+# Deterministic aliases for LLM-hallucinated arg names. The planner doesn't see
+# the authoritative tool signature, so it guesses — e.g. read_file gets
+# {"file_path": ...} when the contract requires "path". Normalize at the
+# validation gate: deterministic, reversible, idempotent, and logged so the
+# correction is visible in decisions.jsonl rather than silently accepted.
+_ARG_ALIASES: dict[str, list[str]] = {
+    "path": ["file_path", "filepath", "filename", "file", "target_path", "path_to_file"],
+    "content": ["code_content", "text_content", "body", "contents"],
+    "query": ["search_query", "q", "search_term"],
+    "code": ["source_code", "snippet", "python_code"],
+}
+
+
+def _normalize_tool_args(fn, fn_args: dict) -> dict:
+    """Rename known alias keys to the canonical parameter names of ``fn``.
+
+    Non-destructive: only renames a key when the canonical name is a real
+    parameter of the tool and is not already provided. Unknown keys pass
+    through untouched so validation reports them.
+    """
+    if not isinstance(fn_args, dict):
+        return fn_args
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return fn_args
+    real_params = set(sig.parameters.keys())
+    out = dict(fn_args)
+    for canonical, aliases in _ARG_ALIASES.items():
+        if canonical not in real_params or canonical in out:
+            continue
+        for alias in aliases:
+            if alias in out:
+                out[canonical] = out.pop(alias)
+                _debug(f"[Args] normalized alias '{alias}' -> '{canonical}' for {fn.__name__}")
+                break
+    return out
+
+
 def validate_tool_args(fn_name: str, fn_args: dict) -> tuple | str:
     """Validate tool arguments against required parameters. Returns (name, args) or error string."""
     fn = TOOL_REGISTRY.get(fn_name) or _learned_tools.get(fn_name)
     if not fn:
         return f"ERROR: Tool '{fn_name}' not found"
+    fn_args = _normalize_tool_args(fn, fn_args)
     try:
         sig = inspect.signature(fn)
     except Exception:
@@ -3041,6 +3128,20 @@ def ask_gemini_tools_only(user_message: str) -> list[str]:
     return results
 
 
+def ask_gemini_with_context(user_message: str, tool_results: list[str]) -> str:
+    """Dispatcher-compatible Gemini call.
+
+    The Gemini family only takes a single ``user_message`` — so when the planner
+    fallback chain passes ``(prompt, tool_results)`` the signature blew up with
+    "ask_gemini() takes 1 positional argument but 2 were given". Inject the tool
+    results into the message text and reuse the existing single-arg path.
+    """
+    if tool_results:
+        packed = "\n".join(str(r) for r in tool_results[:5] if str(r).strip())
+        user_message = f"{user_message}\n\nContext from tools:\n{packed}"
+    return ask_gemini(user_message)
+
+
 def ask_gemini(user_message: str) -> str:
     global _last_model_used
     last_error = None
@@ -3197,7 +3298,7 @@ def _openai_message_get_text(message):
 
 
 # Providers that require the modern tools/tool_choice format
-_TOOLS_FORMAT_PROVIDERS = {"Groq", "OpenRouter"}
+_TOOLS_FORMAT_PROVIDERS = {"Groq", "OpenRouter", "OmniRoute"}
 # Groq gating (Phase 3): groq/compound-mini rejects tool_choice with
 # 400 "tool calling is not supported with this model", so Groq never receives
 # tools unless explicitly opted in via JARVIS_GROQ_TOOLS=1.
@@ -3613,12 +3714,12 @@ def _ask_nim_loop(client, messages: list, model: str, provider_name: str = "NVID
 
 
 def ask_nim_fast(user_message: str, tool_results: list[str]) -> str:
-    """NIM Fast slot: super-49b-v1.5 → nano-30b → step-3.7 (verified 0.3-0.4s)."""
+    """NIM Fast slot: deepseek-v4-flash → gpt-oss-20b → nemotron-super-120b (verified 2026-09-12)."""
     return ask_nim_with_context(user_message, tool_results, models=NIM_MODEL_FAST, provider_name="NIM Fast")
 
 
 def ask_nim_coding(user_message: str, tool_results: list[str]) -> str:
-    """NIM Coding slot: minimax-m3 → gpt-oss-20b → deepseek-v4-flash (verified 1.1-1.8s)."""
+    """NIM Coding slot: deepseek-v4-flash → deepseek-v4-pro → gpt-oss-20b (verified 2026-09-12)."""
     return ask_nim_with_context(user_message, tool_results, models=NIM_MODEL_CODING, provider_name="NIM Coding")
 
 
@@ -3742,6 +3843,19 @@ def ask_openrouter(user_message: str, tool_results: list[str]) -> str:
         OPENROUTER_API_KEY,
         "https://openrouter.ai/api/v1",
         OPENROUTER_MODEL,
+        user_message,
+        tool_results,
+    )
+
+
+def ask_omniroute(user_message: str, tool_results: list[str]) -> str:
+    # OmniRoute gateway (OpenAI-compatible). JARVIS sends the auto-router alias;
+    # OmniRoute selects/serves the upstream and absorbs upstream failures.
+    return _ask_openai_compatible(
+        "OmniRoute",
+        OMNIROUTE_API_KEY,
+        OMNIROUTE_BASE_URL,
+        OMNIROUTE_MODEL,
         user_message,
         tool_results,
     )
@@ -4086,6 +4200,65 @@ def ask_with_tools(user_message: str) -> str:
         return _ask_with_tools_impl(user_message)
 
 
+def ask_llm_internal(prompt: str) -> str:
+    """Internal control-plane call for planner/evaluator/replanner messages.
+
+    These are Jarvis's own structured questions ("You are Jarvis's step
+    evaluator..." / "You are Jarvis's planner..."), NOT user text. They must
+    never be classified as user intents (Issue 3: internal prompts were being
+    misrouted to 'coding'/'tool_use' and accidentally executed as tools).
+
+    This path:
+    - skips classify_intent entirely (no Router line in the debug log)
+    - never promotes to an inference with tool capability
+    - runs a minimal provider fallback chain text-only
+    - ignores spend/budget/caching machinery designed for user turns
+
+    Returns raw provider text (the planner/evaluator expects a short verdict
+    or JSON block), or raises if no internal provider is available.
+    """
+    plan_budget = ProviderBudget(max_attempts=4)
+    attempts = [
+        ("NIM Coding", NVIDIA_NEMOTRON_API_KEY, "https://integrate.api.nvidia.com/v1", NIM_MODEL_CODING[0]),
+        ("NIM Fast", NVIDIA_NEMOTRON_API_KEY, "https://integrate.api.nvidia.com/v1", NIM_MODEL_FAST[0]),
+        ("Gemini internal", GEMINI_API_KEY, None, GEMINI_TOOL_MODEL),  # text-only
+        ("Groq", GROQ_API_KEY, "https://api.groq.com/openai/v1", GROQ_MODEL),
+        ("OmniRoute", OMNIROUTE_API_KEY, OMNIROUTE_BASE_URL, OMNIROUTE_MODEL),
+        ("OpenRouter", OPENROUTER_API_KEY, "https://openrouter.ai/api/v1", OPENROUTER_MODEL),
+    ]
+    last_err = None
+    for name, key, base_url, model in attempts:
+        if not key or not _provider_available(name):
+            continue
+        if not plan_budget.try_reserve(name):
+            continue
+        try:
+            if name == "Gemini internal":
+                reply = ask_gemini(prompt)   # returns plain text, no tool execution
+            else:
+                from openai import OpenAI
+                client = OpenAI(api_key=key, base_url=base_url)
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=1500,
+                    timeout=40,
+                )
+                reply = (resp.choices[0].message.content or "").strip()
+            if not reply:
+                raise Exception(f"{name} internal call empty")
+            _record_provider_success(name)
+            _debug(f"[InternalLLM] {name} answered internal prompt ({len(reply)} chars)")
+            return reply
+        except Exception as e:
+            _debug(f"[InternalLLM] {name} failed internal call: {e}")
+            _handle_provider_failure(name, e)
+            last_err = e
+            continue
+    raise last_err or Exception("No internal LLM provider available")
+
+
 def _dispatch_fallback_chain(prompt: str, tool_results: list, intent: str,
                               budget: ProviderBudget, skip_provider: str | None = None) -> str:
     """Shared fallback chain for user path and planner path.
@@ -4099,11 +4272,12 @@ def _dispatch_fallback_chain(prompt: str, tool_results: list, intent: str,
                        Prevents wasting budget on a near-certain repeat failure.
     """
     raw_providers = [
-        ("Gemini", _gemini_available() and _provider_available("Gemini"), lambda: ask_gemini(prompt, tool_results)),
+        ("Gemini", _gemini_available() and _provider_available("Gemini"), lambda: ask_gemini_with_context(prompt, tool_results)),
         ("Groq", bool(GROQ_API_KEY), lambda: ask_groq(prompt, tool_results)),
         ("NIM Fast", bool(NVIDIA_NEMOTRON_API_KEY), lambda: ask_nim_fast(prompt, tool_results)),
         ("NIM Coding", bool(NVIDIA_NEMOTRON_API_KEY), lambda: ask_nim_coding(prompt, tool_results)),
         ("OpenRouter", bool(OPENROUTER_API_KEY), lambda: ask_openrouter(prompt, tool_results)),
+        ("OmniRoute", bool(OMNIROUTE_API_KEY), lambda: ask_omniroute(prompt, tool_results)),
         ("Pollinations", True, lambda: ask_pollinations(prompt, tool_results)),
     ]
 
@@ -4755,15 +4929,15 @@ def _summarize_paste(content: str, max_chars: int = 8000) -> str:
     if not content or len(content) <= max_chars:
         return content
 
-    # Try using the main provider chain for a quick summary
+    # Try using the internal provider chain for a quick summary (not the
+    # user-facing classify_intent router).
     try:
         from tts import speak as _speak_status
 
-        # Use agent loop with a simple summarization goal
         summary = run_agent_loop(
             goal=f"Summarize this pasted content in 2-3 sentences, preserving key facts, names, and topics:\n\n{content[:8000]}",
             execute_tool_fn=_execute_tool,
-            ask_llm_fn=ask_with_tools,
+            ask_llm_fn=ask_llm_internal,
             speak_fn=_speak_status,
             max_iterations=1,
         )
@@ -5126,7 +5300,7 @@ def _process_impl(text, session_id):
             reply = run_planner_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
-                ask_llm_fn=ask_with_tools,
+                ask_llm_fn=ask_llm_internal,
                 speak_fn=_speak_status,
             )
             return reply
@@ -5150,7 +5324,7 @@ def _process_impl(text, session_id):
             reply = run_planner_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
-                ask_llm_fn=ask_with_tools,
+                ask_llm_fn=ask_llm_internal,
                 speak_fn=_speak_status,
                 task=_active_task,
             )
@@ -5163,7 +5337,7 @@ def _process_impl(text, session_id):
                 reply = run_agent_loop(
                     goal=text,
                     execute_tool_fn=_execute_tool,
-                    ask_llm_fn=ask_with_tools,
+                    ask_llm_fn=ask_llm_internal,
                     speak_fn=_speak_status,
                     max_iterations=max_iterations,
                     task=_active_task,
@@ -5192,7 +5366,7 @@ def _process_impl(text, session_id):
             reply = run_agent_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
-                ask_llm_fn=ask_with_tools,
+                ask_llm_fn=ask_llm_internal,
                 speak_fn=_speak_status,
                 max_iterations=max_iterations,
                 task=_active_task,
@@ -5331,6 +5505,5 @@ def get_last_tool_calls() -> list[str]:
     """Return unique tool names called in the last process() invocation."""
     seen: set = set()
     return [t for t in _tool_call_names if not (t in seen or seen.add(t))]
-
 
 

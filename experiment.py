@@ -711,12 +711,12 @@ def run_autonomous_experiment(
     High-level function to run an autonomous experiment.
     This is the main entry point for Phase 7C.
     """
-    from brain import _execute_tool, ask_with_tools
+    from brain import _execute_tool, ask_llm_internal
     from tts import speak as _speak_status
 
     controller = ExperimentController(
         execute_tool_fn=_execute_tool,
-        ask_llm_fn=ask_with_tools,
+        ask_llm_fn=ask_llm_internal,
         speak_fn=_speak_status,
         max_iterations=max_iterations,
     )

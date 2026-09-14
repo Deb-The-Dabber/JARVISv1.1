@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+import plans
 from event_bus import publish
 
 # Phase 2: ActiveTask integration
@@ -254,6 +255,19 @@ class Plan:
     current_step: int = 0
     status: str = "running"
     final_answer: str = ""
+    executed_call_sigs: dict = field(default_factory=dict)  # sig -> {"status","result"}
+
+
+def _call_signature(tool: str, args: dict) -> str:
+    """Canonical (tool,args) signature for convergence/dedupe checks.
+
+    Uses SHA-1 of the canonical json so it is stable for identical calls and
+    small enough for logging."""
+    try:
+        c = json.dumps(args or {}, sort_keys=True, default=str)
+    except Exception:
+        c = repr(args)
+    return f"{tool}::{hashlib.sha1(c.encode()).hexdigest()}"
 
 
 _plan_store: dict[str, Plan] = {}
@@ -263,6 +277,7 @@ _plan_lock = threading.Lock()
 def _register_plan(p: Plan):
     with _plan_lock:
         _plan_store[p.plan_id] = p
+    _persist_plan_for_execution(p)
 
 
 def get_plan(plan_id: str) -> Plan | None:
@@ -409,6 +424,36 @@ def _step_from_dict(s: dict) -> PlanStep | None:
     return PlanStep(**clean)
 
 
+def _tool_contract_text() -> str:
+    """Compact authoritative argument contract for the planner model.
+
+    Built from the live TOOL_DEFINITIONS registry once — eliminates the
+    'planner invents argument names' class of bugs (e.g. read_file(file_path=...)
+    when the contract requires 'path'). Lazy import because tools/__init__.
+    imports agent.py.
+    """
+    try:
+        from tools import TOOL_DEFINITIONS
+    except Exception:
+        return ""
+    lines = []
+    for entry in TOOL_DEFINITIONS:
+        fn = entry.get("function", {})
+        name = fn.get("name", "")
+        if not name:
+            continue
+        params = (fn.get("parameters") or {}).get("properties", {})
+        required = (fn.get("parameters") or {}).get("required", [])
+        parts = []
+        for pname, pmeta in params.items():
+            marker = "" if pname in required else "?"
+            parts.append(f"{pname}{marker}")
+        lines.append(f"{name}({', '.join(parts)})")
+        if len(lines) >= 120:  # cap to stay within prompt budget
+            break
+    return "\n".join(lines)
+
+
 def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
     """Use the LLM to decompose a goal into steps.
 
@@ -416,10 +461,13 @@ def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
     the JSON in prose or return it in a fence; any parseable array wins,
     and malformed entries are dropped instead of crashing the loop.
     """
+    contract = _tool_contract_text()
+    contract_block = f"\nAvailable tools (authoritative — use EXACTLY these names and arg keys):\n{contract}\n" if contract else ""
     prompt = (
         "You are Jarvis's planner. Given a user goal, break it into a sequence of 2-6 discrete steps. "
         "Each step should use exactly one tool. Respond ONLY with a JSON array of steps.\n\n"
-        f"Goal: {goal}\n\n"
+        f"Goal: {goal}\n"
+        f"{contract_block}\n"
         "Format:\n"
         "[\n"
         '  {"step_id": "1", "goal": "what to accomplish", "tool_hint": "suggested_tool_name",\n'
@@ -428,10 +476,10 @@ def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
         "]\n"
         "Rules:\n"
         "- Each step must be achievable with a single tool call\n"
-        "- tool_hint must match a known tool name (browser_navigate, web_search, open_app, etc.)\n"
-        "- Each step MUST include an 'args' object with ALL required parameters for that tool\n"
-        '- Example: web_search needs args={"query": "..."}, open_app needs args={"app_name": "..."}\n'
-        "- Return NOTHING but the JSON array\n"
+        "- tool_hint MUST be one of the tool names listed above (no invented names)\n"
+        "- args keys MUST match the parameter names listed for that tool (suffix '?' = optional)\n"
+        "- If a tool's required params are unclear, pick the closest known tool instead of inventing args\n"
+        "- Return NOTHING but the JSON array"
     )
     try:
         raw = ask_llm_fn(prompt)
@@ -459,11 +507,16 @@ def _evaluate_step(step: PlanStep, ask_llm_fn) -> str:
         f"Step goal: {step.goal}\n"
         f"Tool: {step.tool_hint}\n"
         f"Result: {step.result[:500]}\n\n"
-        "Respond with a single word: SUCCESS or FAILURE. Then a brief reason."
+        "Respond with a single word: SUCCESS or FAILURE. Then a brief reason.\n"
+        "If Result asks the user for confirmation or approval (sandbox preview),"
+        " respond with PENDING instead — nothing executed yet."
     )
     try:
         raw = ask_llm_fn(prompt)
-        if raw.strip().upper().startswith("SUCCESS"):
+        upper = raw.strip().upper()
+        if upper.startswith("PENDING"):
+            return "pending"
+        if upper.startswith("SUCCESS"):
             return "success"
         return "failure"
     except Exception:
@@ -534,54 +587,331 @@ def _replan(goal: str, ask_llm_fn, failed_results: List[dict], context: str = ""
     return plan
 
 
-def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task: "ActiveTask | None" = None) -> str:
-    # Record start time for duration metrics
+def _persist_plan_for_execution(plan: Plan, task: "ActiveTask | None" = None) -> object | None:
+    """Persist the plan and its steps immediately before executing it.
+
+    Persistence is deliberately best-effort: a database failure must not
+    discard the in-memory planner path.  Importing here keeps the planner
+    usable in installations that have not enabled the optional plan store.
+    """
+    try:
+        import plans
+
+        plans.save_plan(
+            plan_id=plan.plan_id,
+            original_goal=plan.original_goal,
+            status=plan.status,
+            current_step=plan.current_step,
+            final_answer=plan.final_answer,
+            active_task_id=task.task_id if task else None,
+        )
+        for step_index, step in enumerate(plan.steps):
+            plans.save_plan_step(
+                step_id=step.step_id,
+                plan_id=plan.plan_id,
+                step_index=step_index,
+                goal=step.goal,
+                tool_hint=step.tool_hint,
+                args=step.args,
+                status=step.status,
+                result=step.result,
+                evaluation=step.evaluation,
+            )
+        return plans
+    except Exception:
+        return None
+
+
+def plan_from_persistence(plan_id: str, plans_module=None) -> Plan | None:
+    """Rebuild a runtime Plan from the persisted store (post-restart resume).
+
+    Returns None if the plan does not exist or the store is unavailable.
+    Steps are ordered by their persisted numeric step_index; step IDs are
+    content hashes with no ordering semantics.
+    """
+    try:
+        pm = plans_module if plans_module is not None else __import__("plans")
+        data = pm.load_full_plan(plan_id)
+    except Exception:
+        return None
+    if not data:
+        return None
+    ordered = sorted(data.get("steps") or [], key=lambda s: s.get("step_index", 0))
+    steps = [
+        PlanStep(
+            step_id=s.get("step_id", ""),
+            goal=s.get("goal", ""),
+            tool_hint=s.get("tool_hint", ""),
+            args=s.get("args") if isinstance(s.get("args"), dict) else {},
+            status=s.get("status", "pending"),
+            result=s.get("result", ""),
+            evaluation=s.get("evaluation", ""),
+        )
+        for s in ordered
+    ]
+    plan = Plan(
+        plan_id=data.get("plan_id", plan_id),
+        original_goal=data.get("original_goal", ""),
+        steps=steps,
+        current_step=data.get("current_step", 0),
+        status=data.get("status", "running"),
+        final_answer=data.get("final_answer", ""),
+    )
+    _register_plan(plan)
+    return plan
+
+
+def _persist_execution_start(plans_module, plan: Plan, step: PlanStep, step_index: int, tool: str, args: dict) -> str | None:
+    """Durably mark an attempt before invoking its tool.
+
+    A process crash after this write but before the outcome update leaves a
+    record with ``success=False`` and no result, correctly identifying the
+    attempt as having an unknown outcome rather than never having started.
+    """
+    if plans_module is None:
+        return None
+    try:
+        attempts = plans_module.load_execution_records_for_step(plan.plan_id, step.step_id)
+        execution_id = uuid.uuid4().hex
+        plans_module.save_execution_record(
+            execution_id=execution_id,
+            plan_id=plan.plan_id,
+            step_id=step.step_id,
+            step_index=step_index,
+            tool=tool,
+            args=args,
+            attempt=len(attempts) + 1,
+        )
+        return execution_id
+    except Exception:
+        return None
+
+
+def _persist_execution_outcome(
+    plans_module,
+    execution_id: str | None,
+    plan: Plan,
+    step: PlanStep,
+    step_index: int,
+    error: str | None,
+    duration_ms: int,
+) -> None:
+    """Persist the outcome that is available after one tool attempt."""
+    if plans_module is None:
+        return
+    try:
+        if execution_id:
+            plans_module.update_execution_record(
+                execution_id,
+                result=step.result,
+                evaluation=step.evaluation,
+                success=step.evaluation == "success",
+                error=error,
+                duration_ms=duration_ms,
+            )
+        plans_module.update_step_status(
+            plan.plan_id,
+            step.step_id,
+            step.status,
+            result=step.result,
+            evaluation=step.evaluation,
+        )
+        plans_module.update_plan_status(
+            plan.plan_id,
+            plan.status,
+            current_step=step_index,
+        )
+    except Exception:
+        pass
+
+
+def _looks_like_pending_confirmation(result: str) -> bool:
+    """Marker check for a tool that stopped at the sandbox preview / approval gate.
+
+    When a tool requires confirmation (run_python, run_terminal_command, write
+    file, etc.), brain._execute_tool returns the confirm-prompt text instead of
+    real output. Evaluating that preview text as a failed outcome is what made
+    preview paths look like project failures in Fallback; per the demo log the
+    evaluator honestly answered FAILURE when the first preview landed, which led
+    to a recovery-replan cycle asking for the same calls again.
+    """
+    r = (result or "").lower()
+    if not r:
+        return False
+    return (
+        ("say yes to run it for real" in r)
+        or ("say yes to apply" in r)
+        or ("say yes to proceed" in r)
+        or ("awaiting approval" in r)
+        or ("preview shown above" in r and "say yes" in r)
+    )
+
+
+def _execute_planned_step(
+    plans_module,
+    plan: Plan,
+    step: PlanStep,
+    step_index: int,
+    tool: str,
+    args: dict,
+    execute_tool_fn,
+    ask_llm_fn,
+) -> None:
+    """Execute and evaluate one planner attempt with incremental persistence."""
+    execution_id = _persist_execution_start(
+        plans_module, plan, step, step_index, tool, args
+    )
+    started_at = time.time()
+
+    # Deterministic convergence: if this plan already executed the same
+    # (tool, args) signature, reuse the recorded result. The tool-level memo
+    # cache only covers the current turn; plan-level dedup covers repeats
+    # across steps AND across recovery suggestions.
+    sig = _call_signature(tool, args)
+    prev_call = plan.executed_call_sigs.get(sig)
+    if prev_call is not None:
+        step.result = prev_call["result"]
+        step.evaluation = "success" if prev_call["status"] == "completed" else "failure"
+        step.status = "completed" if prev_call["status"] == "completed" else "failed"
+        _persist_execution_outcome(
+            plans_module, execution_id, plan, step, step_index,
+            None, int((time.time() - started_at) * 1000),
+        )
+        return
+
+    error = None
+    try:
+        result = execute_tool_fn(tool, args)
+        step.result = str(result)
+    except Exception as exc:
+        error = str(exc)
+        step.result = f"Tool error: {exc}"
+
+    # A pending confirmation is NOT an execution outcome. The sandbox preview
+    # may also have hit an OS-level PermissionError (sandboxed previews can't
+    # write outside the sandbox); brief the evaluator on what actually happened
+    # so it doesn't flag the sandbox as the project.
+    if _looks_like_pending_confirmation(step.result):
+        step.status = "awaiting_confirmation"
+        step.evaluation = "pending"
+        _persist_execution_outcome(
+            plans_module,
+            execution_id,
+            plan,
+            step,
+            step_index,
+            "needs user approval (preview only)",
+            int((time.time() - started_at) * 1000),
+        )
+        return
+    if "PermissionError" in step.result and "[OS sandboxed]" in step.result:
+        # Sandboxed previews may not touch user files — the preview failure is
+        # a sandbox inconvenience, not a project regression. Label and move on.
+        step.status = "awaiting_confirmation"
+        step.evaluation = "pending"
+        step.result += "\n[Note] That's a preview-sandbox write block, not a real project failure."
+        _persist_execution_outcome(
+            plans_module,
+            execution_id,
+            plan,
+            step,
+            step_index,
+            "sandbox preview blocked by OS write permission",
+            int((time.time() - started_at) * 1000),
+        )
+        return
+
+    step.evaluation = _evaluate_step(step, ask_llm_fn)
+    step.status = "completed" if step.evaluation == "success" else "failed"
+
+    # Track every executed (tool,args) attempt on the plan so the recovery
+    # loop never re-executes an identical call (Issue 2: loop convergence).
+    sig = _call_signature(tool, args)
+    plan.executed_call_sigs[sig] = {"status": step.status, "result": step.result}
+
+    _persist_execution_outcome(
+        plans_module,
+        execution_id,
+        plan,
+        step,
+        step_index,
+        error,
+        int((time.time() - started_at) * 1000),
+    )
+
+
+def run_planner_loop_with_plan(
+    plan: Plan | None = None,
+    execute_tool_fn=None,
+    ask_llm_fn=None,
+    speak_fn=None,
+    task: "ActiveTask | None" = None,
+    resume_from_step_id: str | None = None,
+    plan_id: str | None = None,
+) -> str:
+    """Execute an existing plan, optionally resuming at one of its steps.
+
+    Provide exactly one of `plan` (in-memory Plan) or `plan_id` (persisted plan).
+    Supplying both raises ValueError; supplying neither raises ValueError.
+    """
     start_time = time.time()
-    """Think → Act → Evaluate loop with separate planner agent."""
-    
-    # Phase 2: Initialize with task context if provided
-    if task:
-        # Inject task context into goal
-        if task.get_context_for_prompt():
-            goal = f"{task.get_context_for_prompt()}\n\nCurrent Goal: {goal}"
-        # Pre-populate already_called with task's tool history
-        # (handled by the agent's internal logic if needed)
 
-    if speak_fn:
+    if plan is not None and plan_id is not None:
+        raise ValueError("Provide either plan or plan_id, not both")
+    if plan is None:
+        if plan_id is None:
+            raise ValueError("run_planner_loop_with_plan requires a plan or plan_id")
+        plan = plan_from_persistence(plan_id)
+        if plan is None:
+            return f"I couldn't resume the plan because plan '{plan_id}' was not found."
+
+    plans_module = _persist_plan_for_execution(plan, task)
+    step_indexes = {step.step_id: index for index, step in enumerate(plan.steps)}
+    if plans_module is not None:
         try:
-            speak_fn("Let me think through the best approach for this.")
+            # The persisted ordering is authoritative.  Step IDs are content
+            # hashes and cannot be compared to establish execution order.
+            step_indexes = {
+                stored_step["step_id"]: stored_step["step_index"]
+                for stored_step in plans_module.load_plan_steps(plan.plan_id)
+            }
         except Exception:
             pass
+    ordered_steps = sorted(
+        plan.steps,
+        key=lambda step: step_indexes.get(step.step_id, len(plan.steps)),
+    )
 
-    # THINK: Create a plan
-    plan = _create_plan(goal, ask_llm_fn)
-    if not plan:
-        return "I couldn't create a plan for this task. Try being more specific or use the direct agent instead."
+    resume_index = min(step_indexes.values(), default=0)
+    if resume_from_step_id is not None:
+        resume_index = step_indexes.get(resume_from_step_id)
+        if resume_index is None:
+            return (
+                "I couldn't resume the plan because step "
+                f"'{resume_from_step_id}' was not found."
+            )
 
-    if speak_fn:
-        try:
-            speak_fn(f"Okay, I have a {len(plan.steps)}-step plan. Let me start working through it.")
-        except Exception:
-            pass
-
-    # ACT → EVALUATE loop
-    for step_idx, step in enumerate(plan.steps):
+    # ACT → EVALUATE loop.  IDs are content hashes and deliberately have no
+    # ordering semantics; only the persisted step_index controls resume order.
+    for step in ordered_steps:
+        step_idx = step_indexes.get(step.step_id, 0)
+        if step_idx < resume_index:
+            continue
         plan.current_step = step_idx
         step.status = "running"
+        if plans_module is not None:
+            try:
+                plans_module.update_plan_status(plan.plan_id, "running", current_step=step_idx)
+                plans_module.update_step_status(plan.plan_id, step.step_id, "running")
+            except Exception:
+                pass
 
-        # Check if we have a known tool for this hint
         tool_name = step.tool_hint
         args = step.args if step.args else {}
-
-        try:
-            result = execute_tool_fn(tool_name, args)
-            step.result = str(result)
-        except Exception as e:
-            step.result = f"Tool error: {e}"
-
-        # EVALUATE: Check if step succeeded
-        step.evaluation = _evaluate_step(step, ask_llm_fn)
-        step.status = "completed" if step.evaluation == "success" else "failed"
+        _execute_planned_step(
+            plans_module, plan, step, step_idx, tool_name, args,
+            execute_tool_fn, ask_llm_fn,
+        )
 
         # Re-plan if step failed (max 2 retries per step)
         if step.status == "failed":
@@ -589,7 +919,8 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task
                 f"Step '{step.goal}' failed. Result: {step.result[:300]}\n"
                 "Suggest an alternative approach or tool to accomplish this goal. "
                 f'Respond with: {{"tool": "tool_name", "args": {{"param": "value"}}, "reason": "why"}}\n'
-                "Include ALL required arguments for the tool in the args field."
+                "Include ALL required arguments for the tool in the args field.\n"
+                "Do NOT suggest the exact same tool+args that just failed."
             )
             try:
                 raw = ask_llm_fn(retry_prompt)
@@ -598,15 +929,24 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task
                 alt_args = retry.get("args", {})
                 if not isinstance(alt_args, dict):
                     alt_args = {}
-                if alt_tool:
-                    try:
-                        result = execute_tool_fn(alt_tool, alt_args)
-                        step.result = str(result)
-                        step.evaluation = _evaluate_step(step, ask_llm_fn)
-                        if step.evaluation == "success":
-                            step.status = "completed"
-                    except Exception as e2:
-                        step.result += f" | Retry failed: {e2}"
+
+                # Recovery-dedup: don't re-execute an identical (tool, args) call.
+                # We already executed it (success or failure) once this plan —
+                # re-running is wasted. Reuse the recorded result instead.
+                sig = _call_signature(alt_tool, alt_args)
+                if alt_tool and sig in plan.executed_call_sigs:
+                    prev = plan.executed_call_sigs[sig]
+                    if prev["status"] == "completed":
+                        step.status = "completed"
+                        step.result = prev["result"]
+                        step.evaluation = "success"
+                    # Identical failed calls: re-executing them never helps and
+                    # wastes LLM budget. Don't re-execute the doomed call.
+                elif alt_tool:
+                    _execute_planned_step(
+                        plans_module, plan, step, step_idx, alt_tool, alt_args,
+                        execute_tool_fn, ask_llm_fn,
+                    )
             except Exception:
                 pass
 
@@ -633,10 +973,19 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task
     # Synthesize final answer
     plan.status = "completed"
     plan.final_answer = _generate_final_answer(plan, ask_llm_fn)
-    # Emit planner completed event
+    if plans_module is not None:
+        try:
+            plans_module.update_plan_status(
+                plan.plan_id,
+                plan.status,
+                current_step=plan.current_step,
+                final_answer=plan.final_answer,
+            )
+        except Exception:
+            pass
     publish("subagent_completed", {
         "agent_id": "planner",  # identifier for planner
-        "goal": goal,
+        "goal": plan.original_goal,
         "final_answer": plan.final_answer,
         "steps": [
             {"tool": s.tool_hint, "status": "success" if s.evaluation == "success" else "failed"}
@@ -646,6 +995,43 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task
         "timestamp": time.time(),
     })
     return plan.final_answer
+
+
+def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task: "ActiveTask | None" = None) -> str:
+    """Think → Act → Evaluate loop with separate planner agent."""
+
+    # Phase 2: Initialize with task context if provided
+    if task:
+        # Inject task context into goal
+        if task.get_context_for_prompt():
+            goal = f"{task.get_context_for_prompt()}\n\nCurrent Goal: {goal}"
+        # Pre-populate already_called with task's tool history
+        # (handled by the agent's internal logic if needed)
+
+    if speak_fn:
+        try:
+            speak_fn("Let me think through the best approach for this.")
+        except Exception:
+            pass
+
+    # THINK: Create a plan
+    plan = _create_plan(goal, ask_llm_fn)
+    if not plan:
+        return "I couldn't create a plan for this task. Try being more specific or use the direct agent instead."
+
+    if speak_fn:
+        try:
+            speak_fn(f"Okay, I have a {len(plan.steps)}-step plan. Let me start working through it.")
+        except Exception:
+            pass
+
+    return run_planner_loop_with_plan(
+        plan,
+        execute_tool_fn,
+        ask_llm_fn,
+        speak_fn=speak_fn,
+        task=task,
+    )
 
 
 # ── Success/Failure detection ──

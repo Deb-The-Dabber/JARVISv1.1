@@ -42,18 +42,18 @@ DEFAULT_KEY_ENV = "NVIDIA_NEMOTRON_API_KEY"
 ACTIVE_SLOTS = {
     "fast": {
         "models": [
-            "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-            "nvidia/nemotron-3-nano-30b-a3b",
-            "stepfun-ai/step-3.7-flash",
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "openai/gpt-oss-20b",
+            "nvidia/nemotron-3-super-120b-a12b",
         ],
         "key_env": DEFAULT_KEY_ENV,
     },
     "coding": {
-        "models": ["minimaxai/minimax-m3", "openai/gpt-oss-20b", "deepseek-ai/deepseek-v4-flash-0731"],
+        "models": ["deepseek-ai/deepseek-v4-flash-0731", "deepseek-ai/deepseek-v4-pro-0813", "openai/gpt-oss-20b"],
         "key_env": DEFAULT_KEY_ENV,
     },
     "frontier": {
-        "models": ["nvidia/nemotron-3-ultra-550b-a55b", "minimaxai/minimax-m3"],
+        "models": ["nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v4-pro-0813"],
         "key_env": DEFAULT_KEY_ENV,
     },
     "active_vision": {

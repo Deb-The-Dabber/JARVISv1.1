@@ -70,7 +70,16 @@ def list_directory(path: str = "~") -> str:
 
 
 def run_python(code: str) -> str:
-    """Run Python code in a subprocess with a 30 second timeout."""
+    """Run Python code in a subprocess with a 30 second timeout.
+
+    `code` must be the Python source, not a shell command or an import line.
+    Prefer `run_terminal_command` for shell/pytest invocations."""
+    import ast
+
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return f"Syntax error before execution: {e}"
     from sandbox import run_sandboxed_python
 
     result = run_sandboxed_python(code, timeout=30)
