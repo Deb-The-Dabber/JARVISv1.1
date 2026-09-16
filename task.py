@@ -42,9 +42,69 @@ class TaskStatus:
     RECOVERING = "recovering"
 
 
-_ACTIVE_TASK_FILE = os.path.expanduser("~/.jarvis/active_task.json")
+# V5 rewrite: the task system is a session-scoped registry, not a global
+# singleton. Each task persists as its own file under ~/.jarvis/tasks/; a
+# per-session "current" pointer records which task the conversation is on.
+# The legacy ~/.jarvis/active_task.json is migrated ONCE into an archive and
+# is never auto-resumed (it was the source of stale-task hijack).
+# All paths are env-overridable so tests (including subprocess servers that
+# inherit os.environ) can never touch the real store.
+_LEGACY_ACTIVE_TASK_FILE = os.getenv(
+    "JARVIS_LEGACY_ACTIVE_TASK_FILE", os.path.expanduser("~/.jarvis/active_task.json")
+)
+_TASKS_DIR = os.getenv("JARVIS_TASKS_DIR", os.path.expanduser("~/.jarvis/tasks"))
+_CURRENT_FILE = os.path.join(_TASKS_DIR, "current.json")
+_LEGACY_ARCHIVE_DIR = os.path.join(_TASKS_DIR, "legacy")
 _active_task_lock = threading.RLock()
-_active_task: Optional["ActiveTask"] = None
+_migration_done = False
+
+
+def _task_file(task_id: str) -> str:
+    return os.path.join(_TASKS_DIR, f"task_{task_id}.json")
+
+
+def _load_current_map() -> Dict[str, str]:
+    try:
+        if os.path.exists(_CURRENT_FILE):
+            with open(_CURRENT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_current_map(data: Dict[str, str]) -> None:
+    try:
+        os.makedirs(_TASKS_DIR, exist_ok=True)
+        with open(_CURRENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def _migrate_legacy() -> None:
+    """Archive the legacy global active_task.json once.
+
+    The legacy file represented a single global 'active task' that was not
+    session-scoped and was resumed on any continuation-ish message (the root
+    cause of stale-task hijack). We preserve it by moving it into the archive
+    dir; it is never loaded as the current task.
+    """
+    global _migration_done
+    with _active_task_lock:
+        if _migration_done:
+            return
+        _migration_done = True
+        try:
+            if not os.path.exists(_LEGACY_ACTIVE_TASK_FILE):
+                return
+            os.makedirs(_LEGACY_ARCHIVE_DIR, exist_ok=True)
+            dest = os.path.join(_LEGACY_ARCHIVE_DIR, "active_task.json")
+            if not os.path.exists(dest):
+                os.replace(_LEGACY_ACTIVE_TASK_FILE, dest)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -620,12 +680,19 @@ class ActiveTask:
         updated_at: str = None,
         # Phase 5: Goal criteria
         goal_criteria: List[Dict] = None,
+        # V5 rewrite: session-scoped identity + temporal + plan ownership
+        session_id: str = "default",
+        temporal_context: Dict = None,
+        plan_ids: List[str] = None,
     ):
         self.task_id = task_id
         self.goal = goal
         self.project_root = project_root
         self.phase = phase
         self.status = status
+        self.session_id = session_id
+        self.temporal_context = temporal_context or {}
+        self.plan_ids = plan_ids or []
         self.completed_steps = completed_steps or []
         self.next_action = next_action
         self.progress_metrics = progress_metrics or {
@@ -669,6 +736,9 @@ class ActiveTask:
             "project_root": self.project_root,
             "phase": self.phase,
             "status": self.status,
+            "session_id": self.session_id,
+            "temporal_context": self.temporal_context,
+            "plan_ids": self.plan_ids,
             "completed_steps": self.completed_steps,
             "next_action": self.next_action,
             "progress_metrics": self.progress_metrics,
@@ -693,48 +763,49 @@ class ActiveTask:
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             goal_criteria=data.get("goal_criteria", []),
+            session_id=data.get("session_id", "default"),
+            temporal_context=data.get("temporal_context", {}),
+            plan_ids=data.get("plan_ids", []),
         )
         task.tool_history = data.get("tool_history", {})
         task.execution_budget = data.get("execution_budget", {})
         return task
     
     def save(self) -> None:
-        """Persist task to disk."""
+        """Persist this task to its per-task file."""
         with _active_task_lock:
             try:
-                os.makedirs(os.path.dirname(_ACTIVE_TASK_FILE), exist_ok=True)
+                os.makedirs(_TASKS_DIR, exist_ok=True)
                 self.updated_at = datetime.datetime.now().isoformat()
-                with open(_ACTIVE_TASK_FILE, "w") as f:
+                with open(_task_file(self.task_id), "w", encoding="utf-8") as f:
                     json.dump(self.to_dict(), f, indent=2)
             except Exception as e:
-                print(f"[DEBUG] Failed to save active task: {e}")
+                print(f"[DEBUG] Failed to save task: {e}")
     
     @classmethod
-    def load(cls) -> Optional["ActiveTask"]:
-        """Load task from disk if it exists and is active."""
+    def load(cls, task_id: str = "") -> Optional["ActiveTask"]:
+        """Load a task by id from the registry."""
         with _active_task_lock:
             try:
-                if os.path.exists(_ACTIVE_TASK_FILE):
-                    with open(_ACTIVE_TASK_FILE, "r") as f:
+                if not task_id:
+                    return None
+                path = _task_file(task_id)
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     if isinstance(data, dict):
-                        task = cls.from_dict(data)
-                        # Only resume if task is active/paused
-                        if task.status in (TaskStatus.ACTIVE, TaskStatus.PAUSED):
-                            return task
+                        return cls.from_dict(data)
             except Exception as e:
-                print(f"[DEBUG] Failed to load active task: {e}")
+                print(f"[DEBUG] Failed to load task: {e}")
         return None
     
     @classmethod
     def clear(cls) -> None:
-        """Remove persisted task file."""
-        with _active_task_lock:
-            try:
-                if os.path.exists(_ACTIVE_TASK_FILE):
-                    os.remove(_ACTIVE_TASK_FILE)
-            except Exception:
-                pass
+        """Deprecated global-singleton clear; kept for API compatibility.
+
+        The V5 registry does not have a single 'active task' to clear.
+        """
+        pass
     
     def record_step(self, step_data: dict, tool_name: str = "", args: dict = None, verified: bool = False) -> None:
         """Record a completed step and update progress metrics.
@@ -998,6 +1069,8 @@ class ActiveTask:
             f"Status: {self.status.upper()}",
             f"Completed steps: {len(self.completed_steps)}",
         ]
+        if self.temporal_context.get("note"):
+            lines.append(f"Temporal context: {self.temporal_context['note']}")
         if self.goal_criteria:
             lines.append("Goal Criteria:")
             for i, c in enumerate(self.goal_criteria, 1):
@@ -1074,81 +1147,315 @@ class ActiveTask:
         return req_idx >= cur_idx
 
 
-def get_active_task() -> Optional[ActiveTask]:
-    """Get the currently active task, loading from disk if needed."""
-    global _active_task
+def get_current_task(session_id: str = "default") -> Optional[ActiveTask]:
+    """Return the current task pointer for a session (or None)."""
+    _migrate_legacy()
     with _active_task_lock:
-        if _active_task is None:
-            _active_task = ActiveTask.load()
-        return _active_task
+        current_id = _load_current_map().get(session_id)
+    if not current_id:
+        return None
+    return ActiveTask.load(current_id)
+
+
+def set_current_task(task: Optional[ActiveTask], session_id: str | None = None) -> None:
+    """Set the current-task pointer for a session."""
+    with _active_task_lock:
+        data = _load_current_map()
+        if task is None:
+            data.pop(session_id or "default", None)
+        else:
+            data[task.session_id] = task.task_id
+        _save_current_map(data)
+
+
+def list_tasks(session_id: str | None = None) -> List[ActiveTask]:
+    """List all persisted tasks, optionally filtered by session."""
+    _migrate_legacy()
+    tasks: List[ActiveTask] = []
+    try:
+        for name in os.listdir(_TASKS_DIR):
+            if not name.startswith("task_") or not name.endswith(".json"):
+                continue
+            if name == "current.json":
+                continue
+            path = os.path.join(_TASKS_DIR, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                task = ActiveTask.from_dict(data)
+            except Exception:
+                continue
+            if session_id is None or task.session_id == session_id:
+                tasks.append(task)
+    except Exception:
+        pass
+    return tasks
+
+
+def get_task(task_id: str) -> Optional[ActiveTask]:
+    return ActiveTask.load(task_id)
+
+
+def save_task(task: ActiveTask) -> None:
+    task.save()
+
+
+def archive_task(task_id: str) -> Optional[ActiveTask]:
+    """Mark a task ARCHIVED (kept for reference, never resumable)."""
+    task = ActiveTask.load(task_id)
+    if task:
+        task.status = "archived"
+        task.save()
+        if get_current_task(task.session_id) and get_current_task(task.session_id).task_id == task_id:
+            set_current_task(None, task.session_id)
+    return task
+
+
+def pause_task(task_id: str) -> Optional[ActiveTask]:
+    task = ActiveTask.load(task_id)
+    if task:
+        task.status = TaskStatus.PAUSED
+        task.save()
+    return task
+
+
+def get_active_task() -> Optional[ActiveTask]:
+    """Compat shim: the current task of the default session (never a global
+    singleton across sessions)."""
+    return get_current_task("default")
 
 
 def set_active_task(task: Optional[ActiveTask]) -> None:
-    """Set the active task and persist."""
-    global _active_task
-    with _active_task_lock:
-        _active_task = task
-        if task:
-            task.save()
-        else:
-            ActiveTask.clear()
+    """Compat shim: set the current-task pointer for the task's session."""
+    set_current_task(task, (task.session_id if task else "default"))
 
 
-def create_task(goal: str, project_root: str = "") -> ActiveTask:
-    """Create a new active task."""
+def create_task(goal: str, project_root: str = "", session_id: str = "default",
+                temporal_context: Dict = None, status: str = TaskStatus.ACTIVE) -> ActiveTask:
+    """Create a new task and make it the current task for its session.
+
+    The previous current task of the session is PAUSED (kept, but no longer
+    the active in-conversation task).
+    """
+    _migrate_legacy()
+    prev = get_current_task(session_id)
     task_id = f"task-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}"
-    task = ActiveTask(task_id=task_id, goal=goal, project_root=project_root)
-    set_active_task(task)
+    task = ActiveTask(
+        task_id=task_id,
+        goal=goal,
+        project_root=project_root,
+        session_id=session_id,
+        status=status,
+        temporal_context=temporal_context or {},
+    )
+    task.save()
+    if prev and prev.task_id != task.task_id and prev.status in (TaskStatus.ACTIVE,):
+        prev.status = TaskStatus.PAUSED
+        prev.save()
+    set_current_task(task)
     return task
 
 
 def continue_task() -> Optional[ActiveTask]:
-    """Resume the active task if one exists."""
-    task = get_active_task()
-    if task:
+    """Compat shim: resume the current task of the default session."""
+    task = get_current_task("default")
+    if task and task.status in (TaskStatus.ACTIVE, TaskStatus.PAUSED):
         task.status = TaskStatus.ACTIVE
         task.save()
     return task
 
 
-def complete_task() -> None:
-    """Mark the active task as completed and clear it."""
-    task = get_active_task()
+def complete_task(task_id: str | None = None, session_id: str = "default") -> Optional[ActiveTask]:
+    """Mark a task COMPLETED and clear its current pointer if it is current."""
+    task = task_id and ActiveTask.load(task_id) or get_current_task(session_id)
     if task:
         task.status = TaskStatus.COMPLETED
         task.save()
-        # Keep completed task for reference but clear active
-        set_active_task(None)
+        cur = get_current_task(task.session_id)
+        if cur and cur.task_id == task.task_id:
+            set_current_task(None, task.session_id)
+    return task
 
 
-def get_task_context_for_prompt() -> str:
+def get_task_context_for_prompt(session_id: str = "default") -> str:
     """Get formatted task context for injection into agent prompt."""
-    task = get_active_task()
+    task = get_current_task(session_id)
     if task:
         return task.get_context_for_prompt()
     return ""
 
 
+# ─────────────────────────────────────────────
+# CONTINUATION SIGNALS & DETERMINISTIC RESOLUTION
+# ─────────────────────────────────────────────
+
+_CONTINUATION_PHRASES = (
+    "continue",
+    "keep going",
+    "go on",
+    "continue working",
+    "don't stop",
+    "do not stop",
+    "resume",
+    "next",
+    "carry on",
+    "finish it",
+    "keep working",
+    "proceed",
+    "move on",
+    "go ahead",
+    "finish the job",
+)
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "to", "of", "in",
+    "on", "for", "and", "or", "but", "it", "this", "that", "these", "those",
+    "i", "you", "we", "they", "he", "she", "with", "from", "at", "by",
+    "as", "do", "does", "did", "have", "has", "had", "can", "could", "will",
+    "would", "should", "then", "there", "their", "them", "not", "so", "my",
+    "your", "our", "about", "please", "make", "get", "find", "search", "also",
+    "before", "after", "fix", "fixes", "what", "when", "where", "which", "who",
+    "your", "some", "any", "new", "just", "let", "like", "want", "need",
+}
+
+
+def _significant_tokens(text: str) -> set:
+    return {
+        tok for tok in re.findall(r"[a-z][a-z0-9'-]{1,30}", (text or "").lower())
+        if tok not in _STOPWORDS and len(tok) > 1
+    }
+
+
+def _token_overlap(a: set, b: set) -> int:
+    return len(a & b)
+
+
+def has_continuation_signal(text: str) -> bool:
+    t = re.sub(r"\s+", " ", (text or "").lower().strip())
+    return any(phrase in t for phrase in _CONTINUATION_PHRASES)
+
+
 def is_continuation_request(text: str) -> bool:
-    """Check if user message is a continuation request."""
-    t = text.lower().strip()
-    continuation_phrases = [
-        "continue",
-        "keep going",
-        "go on",
-        "continue working",
-        "don't stop",
-        "do not stop",
-        "resume",
-        "next",
-        "carry on",
-        "finish it",
-        "keep working",
-        "proceed",
-        "move on",
-        "go ahead",
-    ]
-    return any(phrase in t for phrase in continuation_phrases)
+    """Keep the original name as a pure signal check (used by tests/tools).
+
+    NOTE: a continuation signal ALONE never selects a task anymore. Use
+    resolve_task() for actual task selection.
+    """
+    return has_continuation_signal(text)
+
+
+def _reference_cue(text: str) -> bool:
+    """Does the message use a task-reference cue (id, 'task', 'that', 'this')?"""
+    t = (text or "").lower()
+    if re.search(r"\btask[-_][a-z0-9]+\b|\btask\s+(?:[a-z0-9-]{3,})\b", t):
+        return True
+    if re.search(r"\b(resume|continue|finish|proceed|work on|pick up|that)\b", t):
+        return True
+    return False
+
+
+def _explicit_task_ref(message: str, candidates: List[ActiveTask]) -> Optional[ActiveTask]:
+    """Deterministic explicit reference: task id present, or a distinctive
+    goal-phrase match alongside a reference cue."""
+    m_lower = message.lower()
+    for task in candidates:
+        if task.task_id and task.task_id.lower() in m_lower:
+            return task
+        if len(task.task_id) >= 8 and task.task_id[:8].lower() in m_lower:
+            return task
+    msg_tokens = _significant_tokens(message)
+    if _reference_cue(message):
+        best = None
+        best_score = 0
+        for task in candidates:
+            goal_tokens = _significant_tokens(task.goal)
+            score = _token_overlap(msg_tokens, goal_tokens)
+            if score >= 2 and score > best_score:
+                best = task
+                best_score = score
+        if best:
+            return best
+    return None
+
+
+def token_overlap(text_a: str, text_b: str) -> int:
+    """Public deterministic token-overlap score between two strings."""
+    return _token_overlap(_significant_tokens(text_a), _significant_tokens(text_b))
+
+
+def _best_overlap_task(message: str, candidates: List[ActiveTask]) -> Optional[ActiveTask]:
+    """Deterministic semantic overlap (token Jaccard-like count). No LLM."""
+    msg_tokens = _significant_tokens(message)
+    if not msg_tokens:
+        return None
+    best = None
+    best_score = 0
+    for task in candidates:
+        goal_tokens = _significant_tokens(task.goal)
+        score = _token_overlap(msg_tokens, goal_tokens)
+        if score >= 2 and score > best_score:
+            best = task
+            best_score = score
+    return best
+
+
+def resolve_task(session_id: str, message: str) -> Dict[str, Any]:
+    """Deterministically resolve which task (if any) a message refers to.
+
+    Returns {"action": str, "task": Optional[ActiveTask], "reason": str} where
+    action is one of:
+      "explicit"  — the message explicitly references a task
+      "resume"    — continuation of the current in-session task or a strongly
+                    overlapping same-session active/paused task
+      "new"       — explicit new intent; caller should create a new task
+      "none"      — no task involvement (chat / correction / unrelated)
+
+    Precedence (mandated):
+      current explicit intent
+        > conversation-local (current) task reference
+        > strong semantic relationship (same session)
+        > persisted task state (same session only)
+        > never: cross-session, completed/archived, unrelated stale tasks
+    """
+    current = get_current_task(session_id)
+    same_session = [t for t in list_tasks(session_id) if t.task_id != (current.task_id if current else None)]
+
+    resumable = lambda t: t is not None and t.status in (TaskStatus.ACTIVE, TaskStatus.PAUSED)
+
+    # 1. Explicit reference (id or distinctive goal phrase + cue)
+    explicit = _explicit_task_ref(message, [t for t in ([current] if current else []) + same_session])
+    if explicit and resumable(explicit):
+        return {"action": "explicit", "task": explicit, "reason": "explicit task reference"}
+
+    # 1b. Explicit task-id token that is NOT a same-session task (cross-session
+    #     or unknown): never fall through to resume the current task instead.
+    _id_ref = re.search(r"\btask[-_][a-z0-9]{3,}\b", message.lower())
+    if _id_ref:
+        ref_id = _id_ref.group(0)
+        known = {t.task_id.lower() for t in ([current] if current else []) + same_session}
+        if ref_id not in known:
+            return {"action": "none", "task": None, "reason": f"explicit reference to unknown/cross-session task {ref_id}"}
+
+    cont = has_continuation_signal(message)
+
+    # 2. Current in-session task + continuation signal
+    if current and cont and resumable(current):
+        return {"action": "resume", "task": current, "reason": "current task + continuation signal"}
+
+    # 3. Same-session active/paused task with strong semantic overlap + continuation
+    if cont:
+        overlap = _best_overlap_task(message, [t for t in same_session if resumable(t)])
+        if overlap:
+            return {"action": "resume", "task": overlap, "reason": "semantic overlap + continuation signal"}
+
+    # 4. Continuation signal but nothing eligible -> never hijack a stale task
+    if cont:
+        return {"action": "none", "task": None, "reason": "continuation signal but no eligible in-session task"}
+
+    # 5. Otherwise: fresh intent
+    return {"action": "new", "task": None, "reason": "no continuation binding; fresh request"}
 
 
 # Phase 6C/D: Failure Diagnosis & Recovery Planning

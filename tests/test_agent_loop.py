@@ -413,7 +413,7 @@ class TestPhase5GoalCriteria:
 
         task.save()
         from task import ActiveTask as AT
-        reloaded = AT.load()
+        reloaded = AT.load("test-criteria")
         assert reloaded is not None
         assert len(reloaded.goal_criteria) == 2
         assert reloaded.goal_criteria[0]["type"] == "tests_pass"
@@ -830,7 +830,7 @@ class TestPhase7ABudgetEnforcement:
         task.save()
 
         from task import ActiveTask as AT
-        reloaded = AT.load()
+        reloaded = AT.load("test-budget")
         assert reloaded is not None
         assert reloaded.execution_budget["llm_calls"] == 5
         assert reloaded.execution_budget["tool_calls"] == 10
@@ -1208,12 +1208,14 @@ class TestPhaseOwnership:
 
     def test_continuation_preserves_phase(self):
         """Continuation request must preserve EXPLORE phase."""
-        from task import ActiveTask, continue_task, TaskPhase
+        from task import ActiveTask, continue_task, set_current_task, TaskPhase
         
         task = ActiveTask(task_id='test_continuation', goal='Test task', phase=TaskPhase.EXPLORE)
         task.save()
+        set_current_task(task)
         
         continued = continue_task()
+        assert continued is not None
         assert continued.phase == TaskPhase.EXPLORE, f"Phase changed to {continued.phase}"
 
     def test_planner_never_mutates_task_phase(self):

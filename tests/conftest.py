@@ -47,7 +47,58 @@ os.environ.setdefault(
     "JARVIS_SESSIONS_DIR",
     os.path.join(tempfile.gettempdir(), "jarvis_test_sessions"),
 )
+# V5 task/session rewrite: sandbox the task registry, the legacy active_task
+# migration, the agent store, the plans DB, and the temporal overrides so
+# NEITHER in-process code NOR subprocess-spawned servers can touch the real
+# ~/.jarvis store (a prior leak hijacked a live session with task 'test_dup').
+os.environ.setdefault("JARVIS_TASKS_DIR", os.path.join(tempfile.gettempdir(), "jarvis_test_tasks"))
+os.environ.setdefault("JARVIS_LEGACY_ACTIVE_TASK_FILE", os.path.join(tempfile.gettempdir(), "jarvis_test_legacy_task.json"))
+os.environ.setdefault("JARVIS_AGENTS_DB", os.path.join(tempfile.gettempdir(), "jarvis_test_agents.json"))
+os.environ.setdefault("JARVIS_PLANS_DB", os.path.join(tempfile.gettempdir(), "jarvis_test_plans.db"))
+os.environ.setdefault("JARVIS_TEMPORAL_FILE", os.path.join(tempfile.gettempdir(), "jarvis_test_temporal.json"))
 _TEST_ISOLATION_NS = f"{os.getpid()}_{int(time.time())}"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persistent_state(tmp_path, monkeypatch):
+    """Sandbox ALL persistent task/session/plan state away from ~/.jarvis.
+
+    The V5 task registry, the legacy active_task.json, the agent store, the
+    plans SQLite DB, and the temporal overrides must never be written by
+    tests. A prior leak here (a test persisting ActiveTask('test_dup') to the
+    real active_task.json) caused production-state pollution that hijacked a
+    live session.
+
+    Env vars are set so that subprocess-spawned servers (which re-import these
+    modules fresh and inherit os.environ) are isolated too, not just the
+    in-process module globals.
+    """
+    import task
+    import agent
+    import plans
+    import temporal
+
+    env_map = {
+        "JARVIS_TASKS_DIR": str(tmp_path / "tasks"),
+        "JARVIS_LEGACY_ACTIVE_TASK_FILE": str(tmp_path / "legacy_active_task.json"),
+        "JARVIS_AGENTS_DB": str(tmp_path / "agents.json"),
+        "JARVIS_PLANS_DB": str(tmp_path / "plans.db"),
+        "JARVIS_TEMPORAL_FILE": str(tmp_path / "temporal_context.json"),
+    }
+    for k, v in env_map.items():
+        monkeypatch.setenv(k, v)
+    # Refresh module globals that were captured at import time from env.
+    monkeypatch.setattr(task, "_TASKS_DIR", env_map["JARVIS_TASKS_DIR"])
+    monkeypatch.setattr(task, "_CURRENT_FILE", os.path.join(env_map["JARVIS_TASKS_DIR"], "current.json"))
+    monkeypatch.setattr(task, "_LEGACY_ACTIVE_TASK_FILE", env_map["JARVIS_LEGACY_ACTIVE_TASK_FILE"])
+    monkeypatch.setattr(task, "_LEGACY_ARCHIVE_DIR", os.path.join(env_map["JARVIS_TASKS_DIR"], "legacy"))
+    monkeypatch.setattr(task, "_migration_done", False)
+    monkeypatch.setattr(agent, "AGENTS_DB", env_map["JARVIS_AGENTS_DB"])
+    monkeypatch.setattr(plans, "DB_PATH", env_map["JARVIS_PLANS_DB"])
+    monkeypatch.setattr(temporal, "_OVERRIDES_FILE", env_map["JARVIS_TEMPORAL_FILE"])
+    temporal._overrides = {}
+    yield
+    temporal._overrides = {}
 
 
 def _free_port(port: int = 8002):

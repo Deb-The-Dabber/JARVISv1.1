@@ -16,7 +16,7 @@ import sqlite3
 import threading
 from typing import Optional, List, Dict, Any
 
-DB_PATH = os.path.join(os.path.expanduser("~"), ".jarvis", "plans.db")
+DB_PATH = os.getenv("JARVIS_PLANS_DB", os.path.join(os.path.expanduser("~"), ".jarvis", "plans.db"))
 
 _lock = threading.RLock()
 

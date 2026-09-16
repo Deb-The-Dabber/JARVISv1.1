@@ -750,6 +750,13 @@ from task import (
     complete_task,
     get_task_context_for_prompt,
     is_continuation_request,
+    resolve_task,
+    get_current_task,
+    set_current_task,
+    list_tasks,
+    archive_task,
+    pause_task,
+    token_overlap,
 )
 
 
@@ -4217,6 +4224,14 @@ def ask_llm_internal(prompt: str) -> str:
     Returns raw provider text (the planner/evaluator expects a short verdict
     or JSON block), or raises if no internal provider is available.
     """
+    # Authoritative temporal context so the planner/evaluator/replanner never
+    # falls back to the model's training-data year (e.g. 'winter break' -> 2025).
+    try:
+        from temporal import now_context
+
+        temporal_block = now_context("default")
+    except Exception:
+        temporal_block = ""
     plan_budget = ProviderBudget(max_attempts=4)
     attempts = [
         ("NIM Coding", NVIDIA_NEMOTRON_API_KEY, "https://integrate.api.nvidia.com/v1", NIM_MODEL_CODING[0]),
@@ -4234,13 +4249,18 @@ def ask_llm_internal(prompt: str) -> str:
             continue
         try:
             if name == "Gemini internal":
-                reply = ask_gemini(prompt)   # returns plain text, no tool execution
+                gem_prompt = f"[Temporal context]\n{temporal_block}\n\n{prompt}" if temporal_block else prompt
+                reply = ask_gemini(gem_prompt)   # returns plain text, no tool execution
             else:
                 from openai import OpenAI
                 client = OpenAI(api_key=key, base_url=base_url)
+                messages = []
+                if temporal_block:
+                    messages.append({"role": "system", "content": f"Temporal context:\n{temporal_block}"})
+                messages.append({"role": "user", "content": prompt})
                 resp = client.chat.completions.create(
                     model=model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=0.2,
                     max_tokens=1500,
                     timeout=40,
@@ -5000,6 +5020,28 @@ def process(text, session_id="default"):
         return _process_impl(text, session_id)
 
 
+def _resolve_work_task(session_id: str, resolution_action: str, resolved_task,
+                       text: str) -> "ActiveTask | None":
+    """Return the task a planner/agent request should run under.
+
+    - resume/explicit resolution -> that task
+    - 'new' -> reuse the current task if it is the same work item (token
+      overlap), otherwise create a new one (pausing the previous current)
+    - 'none' (vague continuation/correction) -> the current task if any,
+      otherwise None (do not fabricate a task)
+    """
+    if resolved_task is not None:
+        return resolved_task
+    if resolution_action != "new":
+        return get_current_task(session_id)
+    cur = get_current_task(session_id)
+    if cur and cur.status in (TaskStatus.ACTIVE, TaskStatus.PAUSED) and token_overlap(text, cur.goal) >= 2:
+        return cur
+    task = create_task(goal=text, session_id=session_id)
+    _debug(f"[Task] Created task {task.task_id[:8]} for work request")
+    return task
+
+
 def _process_impl(text, session_id):
     global _turn_memo_cache, _current_request_id
     _turn_memo_cache = {}
@@ -5225,22 +5267,47 @@ def _process_impl(text, session_id):
         _pre_reflect = conversation_context.snapshot()
         _debug(f"[Reflect] PRE  state={_pre_reflect['state']} last_problem={'yes' if _pre_reflect['last_problem'] else 'no'}")
 
-    # Phase 2: Active Task continuation handling
-    # Check if there's an active task and user is asking to continue
-    _active_task = get_active_task()
-    _is_continuation = is_continuation_request(text)
-    if _active_task and _is_continuation:
-        _debug(f"[Task] Continuation request detected for task {_active_task.task_id[:8]} — resuming")
+    # Phase 2 (V5 rewrite): Task/session resolution.
+    # Temporal correction handling — a user statement like "the date is
+    # wrong / it's 2026, not 2025" updates the authoritative date context for
+    # this session (and the current task) BEFORE task resolution/planning.
+    try:
+        from temporal import detect_temporal_correction, apply_temporal_correction
+
+        _correction = detect_temporal_correction(text)
+        if _correction:
+            apply_temporal_correction(session_id, _correction)
+            _debug(f"[Temporal] User corrected date -> year {_correction.get('year')}")
+            _tc_task = get_current_task(session_id)
+            if _tc_task:
+                _tc_task.temporal_context = {
+                    **_tc_task.temporal_context,
+                    "note": _correction.get("note", ""),
+                    "year": _correction.get("year"),
+                }
+                _tc_task.save()
+    except Exception as _t_err:
+        _debug(f"[Temporal] correction handling skipped: {_t_err}")
+
+    # Deterministically decide which task (if any) this message refers to.
+    # A continuation signal ALONE never binds to a stale/global task — it
+    # binds only to the current in-session task, an explicit reference, or a
+    # strongly-overlapping same-session active/paused task.
+    _task_resolution = resolve_task(session_id, text)
+    _resolution_action = _task_resolution.get("action", "none")
+    _resolved_task = _task_resolution.get("task")
+    if _resolution_action in ("resume", "explicit") and _resolved_task is not None:
+        _debug(f"[Task] Continuation of task {_resolved_task.task_id[:8]} — {_task_resolution.get('reason')}")
         # Inject task context into the message for the agent
-        task_context = _active_task.get_context_for_prompt()
+        task_context = _resolved_task.get_context_for_prompt()
         text = f"[CONTINUING TASK: {task_context}]\nUser: {text}"
         t = text.lower()
         # Force tool_use intent for continuation
         conversation_context.intent_cache[text] = "tool_use"
-    elif _active_task and not _is_continuation:
-        # User said something else while a task is active - they might be pivoting
-        # We keep the task alive but don't force continuation
-        _debug(f"[Task] Active task {_active_task.task_id[:8]} exists but no continuation request")
+    elif _resolved_task is not None:
+        _debug(f"[Task] Resolved to task {_resolved_task.task_id[:8]} — {_task_resolution.get('reason')}")
+    else:
+        _debug(f"[Task] No task resolved ({_task_resolution.get('reason')})")
 
     # Capability/gap analysis — inject inspect_capabilities result directly
     _capability_gap_patterns = [
@@ -5297,11 +5364,13 @@ def _process_impl(text, session_id):
             from tts import speak as _speak_status
 
             max_iterations = _estimate_task_complexity(text)
+            _compound_task = _resolve_work_task(session_id, _resolution_action, _resolved_task, text)
             reply = run_planner_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
                 ask_llm_fn=ask_llm_internal,
                 speak_fn=_speak_status,
+                task=_compound_task,
             )
             return reply
         except Exception as e:
@@ -5319,14 +5388,15 @@ def _process_impl(text, session_id):
 
             max_iterations = _estimate_task_complexity(text)
             _debug(f"[Complexity] '{text[:50]}' iter={max_iterations} (planner)")
-            # Phase 2: Pass active task to planner if continuing
-            _active_task = get_active_task()
+            # V5: use the resolved task, or create/reuse a work item for this
+            # request so "continue" later binds to THIS task — never a stale one.
+            _planner_task = _resolve_work_task(session_id, _resolution_action, _resolved_task, text)
             reply = run_planner_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
                 ask_llm_fn=ask_llm_internal,
                 speak_fn=_speak_status,
-                task=_active_task,
+                task=_planner_task,
             )
         except Exception as e:
             _debug(f"Planner loop failed: {e}, falling back to agent")
@@ -5357,19 +5427,15 @@ def _process_impl(text, session_id):
 
             max_iterations = _estimate_task_complexity(text)
             _debug(f"[Complexity] '{text[:50]}' iter={max_iterations} (agent)")
-            # Phase 2: Check for active task to continue, or create new one
-            _active_task = get_active_task()
-            if not _active_task:
-                # Create new task for this agent loop
-                _active_task = create_task(goal=text)
-                _debug(f"[Task] Created new task {_active_task.task_id[:8]} for agent loop")
+            # V5: resolved task, or create/reuse a work item for this request.
+            _agent_task = _resolve_work_task(session_id, _resolution_action, _resolved_task, text)
             reply = run_agent_loop(
                 goal=text,
                 execute_tool_fn=_execute_tool,
                 ask_llm_fn=ask_llm_internal,
                 speak_fn=_speak_status,
                 max_iterations=max_iterations,
-                task=_active_task,
+                task=_agent_task,
             )
         except Exception as e:
             _debug(f"Agent loop failed: {e}, falling back")

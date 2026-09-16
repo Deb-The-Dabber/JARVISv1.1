@@ -256,6 +256,10 @@ class Plan:
     status: str = "running"
     final_answer: str = ""
     executed_call_sigs: dict = field(default_factory=dict)  # sig -> {"status","result"}
+    # V5 ownership invariant: every executable plan is bound to its owning
+    # task + session so a stale plan can never leak into another task.
+    owner_task_id: str = ""
+    session_id: str = ""
 
 
 def _call_signature(tool: str, args: dict) -> str:
@@ -454,7 +458,7 @@ def _tool_contract_text() -> str:
     return "\n".join(lines)
 
 
-def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
+def _create_plan(goal: str, ask_llm_fn, owner_task_id: str = "", session_id: str = "") -> Plan | None:
     """Use the LLM to decompose a goal into steps.
 
     Phase 4: robust against plain-completion replies — the model may wrap
@@ -495,6 +499,8 @@ def _create_plan(goal: str, ask_llm_fn) -> Plan | None:
         plan_id=uuid.uuid4().hex[:8],
         original_goal=goal,
         steps=steps,
+        owner_task_id=owner_task_id,
+        session_id=session_id,
     )
     _register_plan(plan)
     return plan
@@ -534,14 +540,15 @@ def _generate_final_answer(plan: Plan, ask_llm_fn) -> str:
 
 
 # Phase 6E: Multi-step replanning
-def _replan(goal: str, ask_llm_fn, failed_results: List[dict], context: str = "") -> Plan | None:
+def _replan(goal: str, ask_llm_fn, failed_results: List[dict], context: str = "",
+            owner_task_id: str = "", session_id: str = "") -> Plan | None:
     """
     Phase 6E: Re-plan based on verification failures.
     Creates a new plan that addresses the failed criteria.
     """
     failed = [r for r in failed_results if not r.get("passed") and r.get("required", True)]
     if not failed:
-        return _create_plan(goal, ask_llm_fn)
+        return _create_plan(goal, ask_llm_fn, owner_task_id=owner_task_id, session_id=session_id)
     
     # Build context from failures
     failure_context = "\n".join([
@@ -582,6 +589,8 @@ def _replan(goal: str, ask_llm_fn, failed_results: List[dict], context: str = ""
         plan_id=uuid.uuid4().hex[:8],
         original_goal=goal,
         steps=steps,
+        owner_task_id=owner_task_id,
+        session_id=session_id,
     )
     _register_plan(plan)
     return plan
@@ -603,7 +612,7 @@ def _persist_plan_for_execution(plan: Plan, task: "ActiveTask | None" = None) ->
             status=plan.status,
             current_step=plan.current_step,
             final_answer=plan.final_answer,
-            active_task_id=task.task_id if task else None,
+            active_task_id=plan.owner_task_id or (task.task_id if task else None),
         )
         for step_index, step in enumerate(plan.steps):
             plans.save_plan_step(
@@ -656,6 +665,8 @@ def plan_from_persistence(plan_id: str, plans_module=None) -> Plan | None:
         current_step=data.get("current_step", 0),
         status=data.get("status", "running"),
         final_answer=data.get("final_answer", ""),
+        owner_task_id=data.get("active_task_id") or "",
+        session_id="",
     )
     _register_plan(plan)
     return plan
@@ -865,6 +876,20 @@ def run_planner_loop_with_plan(
         if plan is None:
             return f"I couldn't resume the plan because plan '{plan_id}' was not found."
 
+    # V5 ownership invariant: a plan only executes under its owning task (or
+    # an explicit plan_id resume). A plan from a different task/session must
+    # never be executed here — that is exactly how stale plans leak across
+    # unrelated requests (the test_dup/hawaii regression).
+    if plan.owner_task_id and task:
+        if plan.owner_task_id != task.task_id or (
+            plan.session_id and task.session_id and plan.session_id != task.session_id
+        ):
+            return (
+                f"I can't run this plan here: it belongs to task "
+                f"{plan.owner_task_id[:8]} but the current task is {task.task_id[:8]}. "
+                f"Start a new request for the current task."
+            )
+
     plans_module = _persist_plan_for_execution(plan, task)
     step_indexes = {step.step_id: index for index, step in enumerate(plan.steps)}
     if plans_module is not None:
@@ -1014,8 +1039,13 @@ def run_planner_loop(goal: str, execute_tool_fn, ask_llm_fn, speak_fn=None, task
         except Exception:
             pass
 
-    # THINK: Create a plan
-    plan = _create_plan(goal, ask_llm_fn)
+    # THINK: Create a plan (bound to its owning task + session)
+    plan = _create_plan(
+        goal,
+        ask_llm_fn,
+        owner_task_id=task.task_id if task else "",
+        session_id=task.session_id if task else "",
+    )
     if not plan:
         return "I couldn't create a plan for this task. Try being more specific or use the direct agent instead."
 
@@ -1196,7 +1226,7 @@ def _filter_narration(text: str) -> str:
 
 _agent_store: dict[str, "Agent"] = {}
 _store_lock = threading.Lock()
-AGENTS_DB = Path.home() / ".jarvis" / "agents.json"
+AGENTS_DB = Path(os.getenv("JARVIS_AGENTS_DB", str(Path.home() / ".jarvis" / "agents.json")))
 
 
 def _save_agents():
