@@ -245,6 +245,7 @@ class PlanStep:
     status: str = "pending"
     result: str = ""
     evaluation: str = ""
+    required: bool = True
 
 
 @dataclass
@@ -405,11 +406,36 @@ def _extract_json_object(text: str) -> dict | None:
     return None
 
 
+def _coerce_required(value) -> bool:
+    """Coerce a planner/persisted ``required`` value to a bool safely.
+
+    The safe default on ANY uncertain value is REQUIRED (True): a required step
+    wrongly treated as optional is a silent downgrade that lets an incomplete
+    plan "complete"; a wrongly-required step only over-blocks (safe). Notably
+    ``null`` -> True (not False), the STRING "false" parses to False (LLMs often
+    emit strings), and malformed structured values default to True.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        # Only strings that clearly mean "false" parse to False. Anything else
+        # (including "null", "none", "", "n/a") is malformed -> safe required.
+        return value.strip().lower() not in ("false", "0", "no", "off")
+    if isinstance(value, (list, tuple, dict, set)):
+        return True  # malformed structured value -> safe default (required)
+    return bool(value)
+
+
 def _step_from_dict(s: dict) -> PlanStep | None:
     """Coerce a raw model dict into a PlanStep, tolerating schema drift."""
     if not isinstance(s, dict):
         return None
-    clean = {k: v for k, v in s.items() if k in {"step_id", "goal", "tool_hint", "args", "status", "result", "evaluation"}}
+    clean = {k: v for k, v in s.items()
+             if k in {"step_id", "goal", "tool_hint", "args", "status", "result", "evaluation", "required"}}
     if not isinstance(clean.get("args"), dict):
         clean["args"] = {}
     # Generate stable step_id from step semantics if not provided or if it's a sequential number
@@ -425,6 +451,8 @@ def _step_from_dict(s: dict) -> PlanStep | None:
     clean.setdefault("status", "pending")
     clean.setdefault("result", "")
     clean.setdefault("evaluation", "")
+    clean.setdefault("required", True)
+    clean["required"] = _coerce_required(clean["required"])
     return PlanStep(**clean)
 
 
@@ -475,7 +503,8 @@ def _create_plan(goal: str, ask_llm_fn, owner_task_id: str = "", session_id: str
         "Format:\n"
         "[\n"
         '  {"step_id": "1", "goal": "what to accomplish", "tool_hint": "suggested_tool_name",\n'
-        '   "args": {"query": "search term", "app_name": "Safari"}},\n'
+        '   "args": {"query": "search term", "app_name": "Safari"},\n'
+        '   "required": true},\n'
         "  ...\n"
         "]\n"
         "Rules:\n"
@@ -483,6 +512,8 @@ def _create_plan(goal: str, ask_llm_fn, owner_task_id: str = "", session_id: str
         "- tool_hint MUST be one of the tool names listed above (no invented names)\n"
         "- args keys MUST match the parameter names listed for that tool (suffix '?' = optional)\n"
         "- If a tool's required params are unclear, pick the closest known tool instead of inventing args\n"
+        '- "required" marks evidence/research steps that MUST succeed for the final artifact to be valid '
+        "(true for research/verification steps, false only for optional/nice-to-have steps).\n"
         "- Return NOTHING but the JSON array"
     )
     try:
@@ -625,7 +656,17 @@ def _persist_plan_for_execution(plan: Plan, task: "ActiveTask | None" = None) ->
                 status=step.status,
                 result=step.result,
                 evaluation=step.evaluation,
+                required=step.required,
             )
+        # Task ↔ plan linkage: makes load_plan_for_task() able to find this
+        # plan when the user asks to resume/retry the current task.
+        if plan.owner_task_id:
+            try:
+                from task import add_plan_to_task
+
+                add_plan_to_task(plan.owner_task_id, plan.plan_id)
+            except Exception:
+                pass
         return plans
     except Exception:
         return None
@@ -655,6 +696,7 @@ def plan_from_persistence(plan_id: str, plans_module=None) -> Plan | None:
             status=s.get("status", "pending"),
             result=s.get("result", ""),
             evaluation=s.get("evaluation", ""),
+            required=_coerce_required(s.get("required", True)),
         )
         for s in ordered
     ]
@@ -851,6 +893,273 @@ def _execute_planned_step(
     )
 
 
+def _planner_step_max_retries() -> int:
+    """Bounded retry budget per step (in addition to the initial attempt)."""
+    try:
+        return max(0, int(os.environ.get("JARVIS_PLAN_STEP_MAX_RETRIES", "2")))
+    except Exception:
+        return 2
+
+
+_PERMANENT_FAILURE_TERMS = (
+    "404",
+    "410",
+    "401",
+    "402",
+    "403",
+    "payment required",
+    "payment wall",
+    "insufficient credits",
+    "no credits",
+    "billing",
+    "insufficient balance",
+    "not supported",
+    "retired",
+    "end of life",
+    "eol",
+    "deprecated",
+    "does not exist",
+    "no such tool",
+    "unknown tool",
+    "function is not found",
+    "not found" ,
+    "invalid api key",
+    "unauthorized",
+    "gone",
+)
+
+
+def _is_permanent_failure(result: str) -> bool:
+    """True when a step failure cannot be fixed by re-running it.
+
+    Auth/payment/EOL/tool-gone errors (404/410/402/403, retired endpoints,
+    hallucinated tools) will fail identically every retry — retrying is
+    pointless. Transient provider errors (timeouts, 429, 500, 503) are NOT
+    treated as permanent so the bounded retry can absorb them.
+    """
+    r = (result or "").lower()
+    if not r:
+        return False
+    return any(term in r for term in _PERMANENT_FAILURE_TERMS)
+
+
+_SYNTHESIS_TOOLS = ("write_file", "create_file", "append_file", "file_write", "save_file")
+_SYNTHESIS_GOAL_TERMS = (
+    # artifact nouns
+    "report",
+    "file",
+    "map",
+    "summary",
+    "output",
+    "findings",
+    "results",
+    "deliverable",
+    "draft",
+    "document",
+    "markdown",
+    "artifact",
+    "problem_map",
+    # artifact verbs / phrases
+    "write",
+    "create",
+    "save",
+    "generate",
+    "persist",
+    "compile",
+    "synthesiz",
+    "produce",
+    "finalize",
+    "put it together",
+    "combine",
+    "final",
+    "build",
+    "record",
+    "update",
+    "edit",
+    "append",
+    "emit",
+    "dump",
+)
+
+
+def _is_synthesis_step(step: PlanStep) -> bool:
+    """Heuristic: is this step a final-artifact / synthesis write?
+
+    A file-write step whose goal mentions writing/creating/saving/generating
+    an artifact. The goal terms are deliberately broad: an artifact write can
+    be phrased many ways ("Create output.md with the findings", "Save final
+    output to ..."), and an ungated artifact write violates the synthesis
+    invariant, so the gate errs toward treating file-writes as artifacts.
+    Research steps never match (their tools aren't file-write tools).
+    """
+    tool = (step.tool_hint or "").strip().lower()
+    if tool not in _SYNTHESIS_TOOLS:
+        return False
+    goal = (step.goal or "").lower()
+    return any(term in goal for term in _SYNTHESIS_GOAL_TERMS)
+
+
+def _step_attempt_count(plans_module, plan: Plan, step: PlanStep) -> int:
+    """Persisted attempt count for a step (across process restarts)."""
+    if plans_module is None:
+        return 0
+    try:
+        return int(plans_module.count_step_attempts(plan.plan_id, step.step_id) or 0)
+    except Exception:
+        return 0
+
+
+# Statuses that are terminal-but-incomplete OR stuck: a required step in one of
+# these must block the artifact. "pending" is deliberately EXCLUDED here — a
+# pending required step simply hasn't run yet (e.g. an artifact-first plan that
+# writes the output file before gathering evidence), so it must not block.
+_BLOCKING_REQUIRED_STATUSES = frozenset({"failed", "blocked", "awaiting_confirmation", "running"})
+
+
+def _incomplete_required_steps(plan: Plan, plans_module,
+                               exclude_step_id: str | None = None,
+                               include_pending: bool = True) -> list[PlanStep]:
+    """Required steps that are NOT completed — runtime or persisted.
+
+    ``include_pending=True`` counts every required step whose status is not
+    "completed" (used by the END gate: any uncompleted required step blocks).
+    ``include_pending=False`` counts only terminal/stuck statuses (failed,
+    blocked, awaiting_confirmation, running) and is used by the ARTIFACT gate —
+    a pending future evidence step or the artifact's own not-yet-set status
+    must not block the write (fixes artifact-first and required-artifact plans
+    that were spuriously blocked).
+    """
+    incomplete: list[PlanStep] = []
+    for s in plan.steps:
+        if not s.required:
+            continue
+        if exclude_step_id and s.step_id == exclude_step_id:
+            continue
+        if include_pending:
+            if s.status != "completed":
+                incomplete.append(s)
+        else:
+            if s.status in _BLOCKING_REQUIRED_STATUSES:
+                incomplete.append(s)
+    if incomplete:
+        return incomplete
+    if plans_module is not None:
+        try:
+            for stored in plans_module.load_plan_steps(plan.plan_id):
+                if not stored.get("required", True):
+                    continue
+                if stored.get("step_id") == exclude_step_id:
+                    continue
+                if include_pending:
+                    blocked = stored.get("status") != "completed"
+                else:
+                    blocked = stored.get("status") in _BLOCKING_REQUIRED_STATUSES
+                if blocked:
+                    for s in plan.steps:
+                        if s.step_id == stored["step_id"]:
+                            incomplete.append(s)
+                            break
+        except Exception:
+            pass
+    return incomplete
+
+
+def _incomplete_evidence_note(failed: list[PlanStep]) -> str:
+    names = ", ".join(f"'{s.goal}'" for s in failed[:5])
+    return (
+        "BLOCKED: this artifact requires evidence that is still missing "
+        f"({names}). The research steps must succeed before the final file "
+        "is written, so the artifact was not generated."
+    )
+
+
+def _incomplete_evidence_report(plan: Plan, incomplete: list[PlanStep]) -> str:
+    """Explicit final response for an incomplete plan — never claims completion."""
+    lines = [
+        f"I could not complete the task: {plan.original_goal}",
+        "",
+        "The following required evidence step(s) are still not complete:",
+    ]
+    for s in incomplete[:10]:
+        if s.status == "awaiting_confirmation":
+            lines.append(f"- {s.goal}: waiting on your approval (the step has not run)")
+        elif s.status == "blocked":
+            lines.append(f"- {s.goal}: blocked")
+        elif s.status == "pending":
+            lines.append(f"- {s.goal}: not yet executed")
+        else:
+            lines.append(f"- {s.goal}: {s.result[:200] or 'no result'}")
+    lines.append("")
+    lines.append(
+        "Because that evidence is missing, the final artifact was NOT generated "
+        "and the work is marked incomplete rather than presented as finished. "
+        "You can ask me to retry the failed steps, or adjust the search query and start again."
+    )
+    return "\n".join(lines)
+
+
+_TOOL_ALIAS_MAP = {
+    "web_search": ("web_search", "websearch", "web-search", "search_web", "internet_search", "search web"),
+    "read_file": ("read_file", "readfile", "file_read"),
+    "write_file": ("write_file", "writefile", "file_write"),
+    "run_terminal_command": ("run_terminal_command", "terminal", "shell"),
+    "get_weather": ("get_weather", "weather", "weather_current"),
+    "get_system_info": ("get_system_info", "sys_info", "system_info"),
+    "get_disk_usage": ("get_disk_usage", "disk_usage", "disk"),
+}
+
+
+def _normalize_tool_name(tool: str, args: dict) -> str:
+    """Normalize a tool name to its canonical form.
+
+    Handles two failure modes observed in the wild:
+      - NIM leaking CoT channel markers into tool names
+        (``read_file<|channel|>commentary``)
+      - planner/model alias spellings (``websearch``, ``search_web``, …)
+    Returns the canonical name, or the (stripped) input if unknown so the
+    executor's own error is the source of truth for unknown tools.
+    """
+    name = (tool or "").strip()
+    if not name:
+        return ""
+    # Strip channel/CoT markers: read_file<|channel|>commentary -> read_file
+    name = re.split(r"[<|]", name)[0].strip()
+    if not name:
+        return ""
+    low = name.lower()
+    for canonical, aliases in _TOOL_ALIAS_MAP.items():
+        if low == canonical or low in aliases:
+            return canonical
+    return name
+
+
+def _recovery_tool(plan: Plan, step: PlanStep, ask_llm_fn) -> str:
+    """Ask for a DIFFERENT tool for a failed step, preserving the original args.
+
+    Returns the suggested tool name ('' if the LLM offers nothing usable).
+    The args are NEVER rewritten here — the evidence being gathered is
+    defined by the original planned query (Bug #5).
+    """
+    prompt = (
+        f"Step '{step.goal}' failed using tool '{step.tool_hint}'.\n"
+        f"Result: {step.result[:300]}\n\n"
+        "Suggest a DIFFERENT tool that can accomplish the SAME goal with the "
+        "EXACT SAME arguments already in use. Do NOT change the arguments — "
+        "the query/values are fixed.\n"
+        'Respond ONLY with JSON: {"tool": "tool_name", "reason": "why"}\n'
+        "If no other tool fits, respond with {\"tool\": \"\"}."
+    )
+    try:
+        raw = ask_llm_fn(prompt)
+        reply = _extract_json_object(raw) or {}
+        suggested = _normalize_tool_name(reply.get("tool", ""), step.args or {})
+        if not suggested or suggested == _normalize_tool_name(step.tool_hint, step.args or {}):
+            return ""
+        return suggested
+    except Exception:
+        return ""
+
+
 def run_planner_loop_with_plan(
     plan: Plan | None = None,
     execute_tool_fn=None,
@@ -859,6 +1168,8 @@ def run_planner_loop_with_plan(
     task: "ActiveTask | None" = None,
     resume_from_step_id: str | None = None,
     plan_id: str | None = None,
+    retry_failed_only: bool = False,
+    replace_tool: str | None = None,
 ) -> str:
     """Execute an existing plan, optionally resuming at one of its steps.
 
@@ -907,7 +1218,11 @@ def run_planner_loop_with_plan(
         key=lambda step: step_indexes.get(step.step_id, len(plan.steps)),
     )
 
-    resume_index = min(step_indexes.values(), default=0)
+    # Resume semantics. A persisted/resume run never re-runs steps that are
+    # already completed, and `retry_failed_only` narrows the run to failed
+    # (and never-attempted) steps only — the original queries are preserved.
+    resume_index = 0
+    skip_completed = plan_id is not None or resume_from_step_id is not None or retry_failed_only
     if resume_from_step_id is not None:
         resume_index = step_indexes.get(resume_from_step_id)
         if resume_index is None:
@@ -916,12 +1231,47 @@ def run_planner_loop_with_plan(
                 f"'{resume_from_step_id}' was not found."
             )
 
+    max_attempts = 1 + _planner_step_max_retries()
+    blocking_failed: list[PlanStep] = []
+
     # ACT → EVALUATE loop.  IDs are content hashes and deliberately have no
     # ordering semantics; only the persisted step_index controls resume order.
     for step in ordered_steps:
         step_idx = step_indexes.get(step.step_id, 0)
         if step_idx < resume_index:
             continue
+        # A completed step is never re-run on a resume/retry pass.
+        if skip_completed and step.status == "completed":
+            continue
+        # On a retry pass, only failed (or never-attempted) steps are eligible.
+        if retry_failed_only and step.status == "completed":
+            continue
+
+        # Synthesis gate: never generate the final artifact while a required
+        # evidence step is failed, blocked, or stuck awaiting confirmation.
+        # The current step is excluded and pending steps do not block (an
+        # artifact-first plan legitimately writes the file before research).
+        if _is_synthesis_step(step):
+            required_failed = _incomplete_required_steps(
+                plan, plans_module,
+                exclude_step_id=step.step_id,
+                include_pending=False,
+            )
+            if required_failed:
+                step.status = "blocked"
+                step.evaluation = "blocked"
+                step.result = _incomplete_evidence_note(required_failed)
+                blocking_failed = required_failed
+                if plans_module is not None:
+                    try:
+                        plans_module.update_step_status(
+                            plan.plan_id, step.step_id, "blocked",
+                            result=step.result, evaluation="blocked",
+                        )
+                    except Exception:
+                        pass
+                break
+
         plan.current_step = step_idx
         step.status = "running"
         if plans_module is not None:
@@ -931,49 +1281,74 @@ def run_planner_loop_with_plan(
             except Exception:
                 pass
 
-        tool_name = step.tool_hint
+        tool_name = _normalize_tool_name(step.tool_hint, step.args or {}) or step.tool_hint
         args = step.args if step.args else {}
-        _execute_planned_step(
-            plans_module, plan, step, step_idx, tool_name, args,
-            execute_tool_fn, ask_llm_fn,
-        )
+        # Explicit tool override ("use normal web_search instead"): swap the
+        # TOOL only — the query/arguments stay exactly as planned.
+        if replace_tool:
+            tool_name = replace_tool
 
-        # Re-plan if step failed (max 2 retries per step)
-        if step.status == "failed":
-            retry_prompt = (
-                f"Step '{step.goal}' failed. Result: {step.result[:300]}\n"
-                "Suggest an alternative approach or tool to accomplish this goal. "
-                f'Respond with: {{"tool": "tool_name", "args": {{"param": "value"}}, "reason": "why"}}\n'
-                "Include ALL required arguments for the tool in the args field.\n"
-                "Do NOT suggest the exact same tool+args that just failed."
+        # Attempt budget: respect already-spent attempts (from prior runs of
+        # this plan) so a resume doesn't retry a step that exhausted its budget.
+        attempts_spent = _step_attempt_count(plans_module, plan, step)
+        if attempts_spent >= max_attempts:
+            step.status = "failed"
+            step.evaluation = "failure"
+            if step.required:
+                blocking_failed.append(step)
+            if plans_module is not None:
+                try:
+                    plans_module.update_step_status(plan.plan_id, step.step_id, "failed",
+                                                    result=step.result, evaluation="failure")
+                except Exception:
+                    pass
+            continue
+
+        # Bounded retry budget for this step: initial attempt + up to N retries.
+        # A provider/tool replacement may swap the TOOL, but NEVER the query/
+        # arguments — the evidence being gathered is defined by the original args.
+        retries_used = 0
+        while True:
+            _execute_planned_step(
+                plans_module, plan, step, step_idx, tool_name, args,
+                execute_tool_fn, ask_llm_fn,
             )
-            try:
-                raw = ask_llm_fn(retry_prompt)
-                retry = _extract_json_object(raw) or {}
-                alt_tool = retry.get("tool", "")
-                alt_args = retry.get("args", {})
-                if not isinstance(alt_args, dict):
-                    alt_args = {}
+            if step.status == "awaiting_confirmation":
+                break
+            if step.status == "completed":
+                break
+            # Permanent failures are not pointlessly retried.
+            if _is_permanent_failure(step.result):
+                break
+            if retries_used >= _planner_step_max_retries():
+                break
+            attempts_spent = _step_attempt_count(plans_module, plan, step)
+            if attempts_spent >= max_attempts:
+                break
+            # Recovery: ask the LLM for a DIFFERENT tool only. Arguments stay
+            # exactly as planned (Bug #5: alt_args used to lose the query).
+            alt_tool = _recovery_tool(plan, step, ask_llm_fn)
+            if not alt_tool:
+                break
+            # Recovery-dedup: never re-execute an identical (tool, args) call
+            # already made this plan — re-running a doomed call wastes budget.
+            # Distinct tool/args combos are allowed until the retry budget
+            # (max 2 additional attempts) is spent.
+            sig = _call_signature(alt_tool, args)
+            prev = plan.executed_call_sigs.get(sig)
+            if prev is not None:
+                if prev["status"] == "completed":
+                    step.status = "completed"
+                    step.result = prev["result"]
+                    step.evaluation = "success"
+                break
+            tool_name = alt_tool
+            retries_used += 1
 
-                # Recovery-dedup: don't re-execute an identical (tool, args) call.
-                # We already executed it (success or failure) once this plan —
-                # re-running is wasted. Reuse the recorded result instead.
-                sig = _call_signature(alt_tool, alt_args)
-                if alt_tool and sig in plan.executed_call_sigs:
-                    prev = plan.executed_call_sigs[sig]
-                    if prev["status"] == "completed":
-                        step.status = "completed"
-                        step.result = prev["result"]
-                        step.evaluation = "success"
-                    # Identical failed calls: re-executing them never helps and
-                    # wastes LLM budget. Don't re-execute the doomed call.
-                elif alt_tool:
-                    _execute_planned_step(
-                        plans_module, plan, step, step_idx, alt_tool, alt_args,
-                        execute_tool_fn, ask_llm_fn,
-                    )
-            except Exception:
-                pass
+        # A required step that is not completed (failed, or stuck awaiting user
+        # confirmation) must block the plan — it never actually ran.
+        if step.required and step.status in ("failed", "awaiting_confirmation", "blocked"):
+            blocking_failed.append(step)
 
         # Announce progress for multi-step plans
         if speak_fn and len(plan.steps) > 1:
@@ -995,9 +1370,18 @@ def run_planner_loop_with_plan(
             task.record_step(step_data, step.tool_hint, step.args)
             task.save()
 
-    # Synthesize final answer
-    plan.status = "completed"
-    plan.final_answer = _generate_final_answer(plan, ask_llm_fn)
+    # ── Synthesis gate ──────────────────────────────────────────────────────
+    # If any required step is not completed after the bounded retry budget, the
+    # research is incomplete. Do NOT mark the plan completed and do NOT present
+    # the work as complete — report the missing evidence explicitly.
+    if not blocking_failed:
+        blocking_failed = _incomplete_required_steps(plan, plans_module)
+    if blocking_failed:
+        plan.status = "blocked"
+        plan.final_answer = _incomplete_evidence_report(plan, blocking_failed)
+    else:
+        plan.status = "completed"
+        plan.final_answer = _generate_final_answer(plan, ask_llm_fn)
     if plans_module is not None:
         try:
             plans_module.update_plan_status(
@@ -1013,7 +1397,7 @@ def run_planner_loop_with_plan(
         "goal": plan.original_goal,
         "final_answer": plan.final_answer,
         "steps": [
-            {"tool": s.tool_hint, "status": "success" if s.evaluation == "success" else "failed"}
+            {"tool": s.tool_hint, "status": "success" if s.evaluation == "success" else s.status or "failed"}
             for s in plan.steps
         ],
         "duration": time.time() - start_time,

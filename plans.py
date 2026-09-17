@@ -55,11 +55,18 @@ def init_db() -> None:
                     status TEXT NOT NULL DEFAULT 'pending',
                     result TEXT DEFAULT '',
                     evaluation TEXT DEFAULT '',
+                    required INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (plan_id, step_id)
                 )
             """)
+            # Migration guard: existing DBs created before the `required` column.
+            try:
+                conn.execute("ALTER TABLE plan_steps ADD COLUMN required INTEGER NOT NULL DEFAULT 1")
+                conn.commit()
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS execution_records (
                     execution_id TEXT PRIMARY KEY,
@@ -114,6 +121,7 @@ def _row_to_plan_step(row: sqlite3.Row) -> Dict[str, Any]:
         "status": row["status"],
         "result": row["result"],
         "evaluation": row["evaluation"],
+        "required": bool(row["required"]) if "required" in row.keys() else True,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -217,6 +225,25 @@ def set_plan_active_task(plan_id: str, active_task_id: str) -> None:
             conn.commit()
 
 
+def load_plan_for_task(active_task_id: str, exclude_status: tuple = ("completed",)) -> Optional[Dict[str, Any]]:
+    """Load the most recently updated plan owned by an ActiveTask.
+
+    Optionally excludes statuses (default skips completed plans). Returns the
+    plan dict or None if the task owns no qualifying plan.
+    """
+    if not active_task_id:
+        return None
+    with _connect() as conn:
+        q = "SELECT * FROM plans WHERE active_task_id = ?"
+        params: list = [active_task_id]
+        if exclude_status:
+            q += " AND status NOT IN (%s)" % ",".join("?" * len(exclude_status))
+            params.extend(exclude_status)
+        q += " ORDER BY updated_at DESC LIMIT 1"
+        row = conn.execute(q, params).fetchone()
+        return _row_to_plan(row) if row else None
+
+
 def list_plans(limit: int = 100, status: Optional[str] = None) -> List[Dict[str, Any]]:
     """List plans, optionally filtered by status."""
     with _connect() as conn:
@@ -256,6 +283,7 @@ def save_plan_step(
     status: str = "pending",
     result: str = "",
     evaluation: str = "",
+    required: bool = True,
 ) -> None:
     """Insert or replace a plan step."""
     now = datetime.datetime.now().isoformat()
@@ -264,8 +292,8 @@ def save_plan_step(
         with _connect() as conn:
             conn.execute(
                 """
-                INSERT INTO plan_steps (plan_id, step_id, step_index, goal, tool_hint, args_json, status, result, evaluation, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO plan_steps (plan_id, step_id, step_index, goal, tool_hint, args_json, status, result, evaluation, required, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(plan_id, step_id) DO UPDATE SET
                     step_index = excluded.step_index,
                     goal = excluded.goal,
@@ -274,9 +302,11 @@ def save_plan_step(
                     status = excluded.status,
                     result = excluded.result,
                     evaluation = excluded.evaluation,
+                    required = excluded.required,
                     updated_at = excluded.updated_at
                 """,
-                (plan_id, step_id, step_index, goal, tool_hint, args_json, status, result, evaluation, now, now),
+                (plan_id, step_id, step_index, goal, tool_hint, args_json, status,
+                 result, evaluation, int(bool(required)), now, now),
             )
             conn.commit()
 
@@ -411,6 +441,16 @@ def load_latest_execution_for_step(plan_id: str, step_id: str) -> Optional[Dict[
             (plan_id, step_id),
         ).fetchone()
         return _row_to_execution_record(row) if row else None
+
+
+def count_step_attempts(plan_id: str, step_id: str) -> int:
+    """Count how many times a step has been attempted (execution records)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM execution_records WHERE plan_id = ? AND step_id = ?",
+            (plan_id, step_id),
+        ).fetchone()
+        return int(row["n"]) if row else 0
 
 
 def update_execution_record(

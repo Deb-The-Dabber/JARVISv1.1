@@ -133,6 +133,7 @@ GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
 # Verified live against the NIM catalog on 2026-09-12. All four legacy slots
 # (llama-3.3-nemotron-super-49b-v1.5, nemotron-3-nano-30b-a3b,
 # step-3.7-flash, minimax-m3) returned 410/EOL — removed from routing.
+# 2026-09-16: deepseek-v4-pro-0813 hit 410 (EOL 2026-09-14) — removed.
 NIM_MODEL_FAST = [
     "deepseek-ai/deepseek-v4-flash-0731",   # verified 0.3s ping
     "openai/gpt-oss-20b",                     # verified 0.7s
@@ -140,12 +141,10 @@ NIM_MODEL_FAST = [
 ]
 NIM_MODEL_CODING = [
     "deepseek-ai/deepseek-v4-flash-0731",   # verified 0.3s
-    "deepseek-ai/deepseek-v4-pro-0813",     # verified 30.5s (strong, slow)
     "openai/gpt-oss-20b",                   # verified 0.7s
 ]
 NIM_MODEL_FRONTIER = [
     "nvidia/nemotron-3-ultra-550b-a55b",
-    "deepseek-ai/deepseek-v4-pro-0813",     # strongest verified live model
 ]
 # Defined but NOT registered as an active routing slot: the E4 probe must
 # prove reliable (<10s) latency first (2026-08-13 probe: 21.7s for 1 token).
@@ -558,8 +557,9 @@ _process_lock = threading.RLock()
 pending_action = {"fn": None, "description": None, "expires_at": 0}
 _learned_tools = {}
 _loading_learned_tools = False
-_pending_safe = {"tool": None, "fn": None, "args": None, "level": None, "expires_at": 0}
+_pending_safe = {"tool": None, "fn": None, "args": None, "level": None, "session_id": None, "expires_at": 0}
 _pending_lock = threading.Lock()
+_current_session_id: str | None = None
 _genai_client = None
 _gemini_backoff_until = 0.0
 _last_model_used = "unknown"
@@ -724,6 +724,8 @@ def run_planner_loop_with_plan(
     task=None,
     resume_from_step_id: str | None = None,
     plan_id: str | None = None,
+    retry_failed_only: bool = False,
+    replace_tool: str | None = None,
 ) -> str:
     """Execute a supplied plan, resuming at a specific persisted step if asked.
     Provide either plan (in-memory) or plan_id (persisted).
@@ -736,6 +738,8 @@ def run_planner_loop_with_plan(
         task=task,
         resume_from_step_id=resume_from_step_id,
         plan_id=plan_id,
+        retry_failed_only=retry_failed_only,
+        replace_tool=replace_tool,
     )
 
 
@@ -757,6 +761,7 @@ from task import (
     archive_task,
     pause_task,
     token_overlap,
+    detect_control_command,
 )
 
 
@@ -780,6 +785,20 @@ def _session_append(session_id: str, role: str, content: str) -> None:
 
     conversation.append({"role": role, "content": content})
     append_message(session_id, role, content)
+
+
+def ingest_file_into_context(session_id: str, path: str) -> str:
+    """Ingest a file (any format) and place its text into the conversation.
+
+    Used by the terminal `/file` command and pasted-path auto-detect so a
+    homework file lands in context for follow-up turns. Returns the text that
+    was appended (capped + summarized by tools.ingest_tools.ingest_file).
+    """
+    from tools.ingest_tools import ingest_file
+
+    result = ingest_file(path)
+    _session_append(session_id, "user", f"[ingested file: {path}]\n{result}")
+    return result
 
 
 def reset_conversation(session_id: str = "default", timeout: float = 60.0) -> None:
@@ -3726,7 +3745,7 @@ def ask_nim_fast(user_message: str, tool_results: list[str]) -> str:
 
 
 def ask_nim_coding(user_message: str, tool_results: list[str]) -> str:
-    """NIM Coding slot: deepseek-v4-flash → deepseek-v4-pro → gpt-oss-20b (verified 2026-09-12)."""
+    """NIM Coding slot: deepseek-v4-flash → gpt-oss-20b (deepseek-v4-pro EOL'd 2026-09-14)."""
     return ask_nim_with_context(user_message, tool_results, models=NIM_MODEL_CODING, provider_name="NIM Coding")
 
 
@@ -4802,12 +4821,13 @@ def get_provider_status_summary() -> str:
     return " | ".join(parts) if parts else ""
 
 
-def set_pending_safe(tool, fn, args, level):
+def set_pending_safe(tool, fn, args, level, session_id: str | None = None):
     with _pending_lock:
         _pending_safe["tool"] = tool
         _pending_safe["fn"] = fn
         _pending_safe["args"] = args
         _pending_safe["level"] = level
+        _pending_safe["session_id"] = session_id or _current_session_id
         _pending_safe["expires_at"] = time.time() + SAFETY_PENDING_TTL
 
 
@@ -4817,6 +4837,7 @@ def clear_pending_safe():
         _pending_safe["fn"] = None
         _pending_safe["args"] = None
         _pending_safe["level"] = None
+        _pending_safe["session_id"] = None
         _pending_safe["expires_at"] = 0
 
 
@@ -5042,16 +5063,75 @@ def _resolve_work_task(session_id: str, resolution_action: str, resolved_task,
     return task
 
 
+# Confirmation matching (Bug #7): "write the file" is a confirmation for a
+# staged file write, not a fresh request. Phrases only — never bare verbs, so
+# data-plane requests like "write a poem" / "apply for a job" don't match.
+# BARE words are unambiguous confirmations (yes/yeah/approved/...). PHRASE
+# patterns ("do it", "go ahead", "write the file", "apply it") are ambiguous in
+# ordinary speech ("do it yourself", "go ahead and explain the concept") — they
+# only confirm when the message is command-like (_is_command_like), so a normal
+# conversational phrase can never trigger a destructive pending-op apply.
+_YES_WORDS_BARE = [
+    r"\byes\b",
+    r"\byeah\b",
+    r"\byep\b",
+    r"\byup\b",
+    r"\bconfirmed\b",
+    r"\bapproved\b",
+]
+_YES_WORDS_PHRASE = [
+    r"\bdo it\b",
+    r"\bgo ahead\b",
+    r"\bsend it\b",
+    r"\b(write|create|make|save)\s+the\s+file\b",
+    r"\bapply\s+(it|the\s+(change|patch|edit|file|write))\b",
+]
+_NO_WORDS = [r"\bno\b", r"\bnope\b", r"\bcancel\b", r"\bstop\b", r"\bnevermind\b", r"\bdeny\b"]
+
+
+def _matches_yes(text: str) -> bool:
+    """Confirmation matcher: bare yes-words, or command-like phrase patterns."""
+    t = text or ""
+    if any(re.search(p, t) for p in _YES_WORDS_BARE):
+        return True
+    if any(re.search(p, t) for p in _YES_WORDS_PHRASE):
+        try:
+            from task import _is_command_like
+        except Exception:
+            return True
+        return _is_command_like(t)
+    return False
+
+
+def _pending_belongs_to_session(session_id: str) -> bool:
+    """Bug #8: a pending op staged in another session must never be applied here.
+
+    Cross-session leakage happened when a confirmation response in session B
+    applied a pending op staged earlier in session A. The pending op records
+    the session that created it; a mismatch clears the stale op so the current
+    message routes normally instead of confirming someone else's action.
+    """
+    pend = _pending_safe.get("session_id")
+    if not pend:
+        return True  # unbound (legacy path) — allow
+    return pend == session_id
+
+
 def _process_impl(text, session_id):
-    global _turn_memo_cache, _current_request_id
+    global _turn_memo_cache, _current_request_id, _current_session_id
     _turn_memo_cache = {}
     _tool_call_names.clear()
     _current_request_id = new_request_id()
+    _current_session_id = session_id
     _start_time = time.time()
     # Clear intent cache for new turn
     conversation_context.intent_cache.clear()
     text = _sanitize_user_message(text)
     t = text.lower()
+    # Original (pre-prefixing) text — control-plane detection must run on the
+    # user's own words, NOT the injected "[CONTINUING TASK: ...]" context whose
+    # goal may itself contain control phrases (context-injection hijack).
+    _ctl_user_text = t
 
     log_decision(
         phase="understand",
@@ -5091,21 +5171,13 @@ def _process_impl(text, session_id):
     except Exception:
         pass
 
-    yes_words = [
-        r"\byes\b",
-        r"\byeah\b",
-        r"\byep\b",
-        r"\byup\b",
-        r"\bdo it\b",
-        r"\bgo ahead\b",
-        r"\bconfirmed\b",
-        r"\bsend it\b",
-        r"\bapproved\b",
-    ]
-    no_words = [r"\bno\b", r"\bnope\b", r"\bcancel\b", r"\bstop\b", r"\bnevermind\b", r"\bdeny\b"]
+    no_words = _NO_WORDS
 
     def _matches_any(patterns, text):
         return any(re.search(p, text) for p in patterns)
+
+    def _matches_confirmation(text):
+        return _matches_yes(text)
 
     # Track original user message (not confirmation responses)
     if not has_pending_safe() and not has_pending_action():
@@ -5115,16 +5187,15 @@ def _process_impl(text, session_id):
     # Typed confirmation for self-modification (sandbox review)
     if action_sandbox.has_typed_pending():
         _tp = action_sandbox.get_typed_pending()
-        if _tp and (t.strip().lower() == _tp.get("confirmation_text", "") or _matches_any(yes_words, t)):
+        if _tp and (t.strip().lower() == _tp.get("confirmation_text", "") or _matches_confirmation(t)):
             _tp_result = action_sandbox.apply_staged_selfmod()
             action_sandbox.clear_typed_pending()
             clear_pending_safe()
             file_sandbox.clear_pending()
             _debug(f"[Confirm] Self-mod applied: {_tp_result}")
-            reply = ask_with_tools(_last_user_message)
-            if conversation and conversation[-1].get("role") == "assistant":
-                conversation[-1]["content"] = reply
-            return reply
+            # Bug #7: do NOT re-run the original request after applying — the
+            # change is already staged+applied; re-processing would re-stage it.
+            return f"Applied. {_tp_result}"
         if _tp and _matches_any(no_words, t):
             from safety import log_audit
 
@@ -5138,19 +5209,27 @@ def _process_impl(text, session_id):
             "— or say no to cancel."
         )
 
+    # Bug #8: never apply a pending op that was staged in a DIFFERENT session.
+    # A confirmation message in session B must not execute a write that session
+    # A staged. The stale op is cleared so the message routes normally instead.
+    if has_pending_safe() and not _pending_belongs_to_session(session_id):
+        _debug("[Confirm] Discarding pending op staged in another session")
+        clear_pending_safe()
+        file_sandbox.clear_pending()
+        action_sandbox.clear_typed_pending()
+
     if has_pending_safe():
-        if _matches_any(yes_words, t):
+        if _matches_confirmation(t):
             if action_sandbox.is_selfmod(_pending_safe["tool"], _pending_safe["args"]) and not action_sandbox.has_typed_pending():
                 clear_pending_safe()
                 return "Self-modification needs a typed confirmation — please ask me to make the change again."
             result = execute_pending_safe()
             if result:
-                _debug("[Confirm] Confirmed, continuing with original request")
-                reply = ask_with_tools(_last_user_message)
-                # Replace the "I need your permission" message with the full response
-                if conversation and conversation[-1].get("role") == "assistant":
-                    conversation[-1]["content"] = reply
-                return reply
+                _debug("[Confirm] Confirmed, execution completed")
+                # Bug #7: do NOT re-run ask_with_tools(_last_user_message) — the
+                # confirmed action already executed; re-processing the original
+                # message would re-stage the write / re-trigger confirmation.
+                return result
             return "Something went wrong executing that action."
         elif _matches_any(no_words, t):
             tool = _pending_safe["tool"]
@@ -5163,7 +5242,7 @@ def _process_impl(text, session_id):
             return "Okay, cancelled."
 
     if has_pending_action():
-        if _matches_any(yes_words, t):
+        if _matches_confirmation(t):
             fn = pending_action["fn"]
             clear_pending()
             return fn()
@@ -5308,6 +5387,51 @@ def _process_impl(text, session_id):
         _debug(f"[Task] Resolved to task {_resolved_task.task_id[:8]} — {_task_resolution.get('reason')}")
     else:
         _debug(f"[Task] No task resolved ({_task_resolution.get('reason')})")
+
+    # ── Control-plane handler ──────────────────────────────────────────────
+    # Operates ONLY on the CURRENT task's persisted plan work. It fires only
+    # when resolve_task() bound this message to a task (resume/explicit) — a
+    # fresh request, a cross-session reference, or a non-task phrase never
+    # reaches it, so the cross-session/stale-task protections stay intact.
+    # detect_control_command is deliberately phrase-scoped (not a broad
+    # substring matcher) so "run a marathon plan" / "write a poem" are never
+    # treated as control commands.
+    if _resolved_task is not None:
+        _ctl_directives = [
+            d for d in detect_control_command(_ctl_user_text)
+            if d.get("type") in ("resume_plan", "retry_failed")
+        ]
+        if _ctl_directives:
+            _ctl_plan = None
+            try:
+                from plans import load_plan_for_task
+
+                _ctl_plan = load_plan_for_task(_resolved_task.task_id, exclude_status=("completed",))
+            except Exception as _ctl_plan_err:
+                _debug(f"[Control] plan lookup failed: {_ctl_plan_err}")
+            if _ctl_plan is not None:
+                _ctl_primary = _ctl_directives[0]
+                try:
+                    from tts import speak as _speak_status
+
+                    _debug(
+                        f"[Control] task {_resolved_task.task_id[:8]} → "
+                        f"{_ctl_primary['type']} plan {_ctl_plan['plan_id']}"
+                    )
+                    _ctl_reply = run_planner_loop_with_plan(
+                        plan_id=_ctl_plan["plan_id"],
+                        execute_tool_fn=_execute_tool,
+                        ask_llm_fn=ask_llm_internal,
+                        speak_fn=_speak_status,
+                        task=_resolved_task,
+                        retry_failed_only=(_ctl_primary["type"] == "retry_failed"),
+                        replace_tool=_ctl_primary.get("replace_tool"),
+                    )
+                    _session_append(session_id, "user", text)
+                    _session_append(session_id, "assistant", _ctl_reply)
+                    return _ctl_reply
+                except Exception as _ctl_err:
+                    _debug(f"[Control] plan resume failed: {_ctl_err}")
 
     # Capability/gap analysis — inject inspect_capabilities result directly
     _capability_gap_patterns = [

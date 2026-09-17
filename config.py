@@ -113,7 +113,6 @@ MODEL_CONTEXT_LIMITS = {
     # 410 Gone on the live NIM endpoint — never route to them again.
     "openai/gpt-oss-20b": 32768,
     "deepseek-ai/deepseek-v4-flash-0731": 32768,
-    "deepseek-ai/deepseek-v4-pro-0813": 32768,
     "gemini-3.5-flash": 32768,
     "gemini-2.5-flash": 32768,
     "deepseek-ai/deepseek-v4-flash": 32768,

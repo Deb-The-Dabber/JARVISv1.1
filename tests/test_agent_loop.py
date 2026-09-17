@@ -1408,34 +1408,42 @@ class TestRecoveryLoopBounded:
         import agent
 
         calls = []
-        given = []
 
         def fake_execute(tool, args):
             calls.append((tool, args))
             return f"executed {tool}"
 
-        # A step always fails evaluation; a recovery ask always comes back with a
-        # different tool — we keep allowing it until the plan-wide counter stops it.
-        answer_sequence = iter(
-            ["FAILURE",  # evaluation of the step
-             '{"tool": "t2", "args": {"a": 2}}',  # recovery asks for a different tool
-             ]
-        )
+        # Every evaluation fails; recovery always offers a NEW distinct tool so
+        # the dedup guard can't stop it — the bounded per-step retry budget
+        # (initial attempt + 2 retries) must be what stops the loop. Recovery
+        # must also PRESERVE the original args (never accept model-supplied ones).
+        ask_n = [0]
 
         def fake_ask(prompt):
-            return next(answer_sequence)
+            ask_n[0] += 1
+            if "step evaluator" in prompt:
+                return "FAILURE"
+            if "DIFFERENT tool" in prompt:
+                return '{"tool": "rt%d", "args": {"hijacked": 1}, "reason": "swap"}' % ask_n[0]
+            return "ok"
 
         from agent import Plan, PlanStep, run_planner_loop_with_plan
-        plan = Plan(plan_id="p_forever", original_goal="g",
-                    steps=[
-                        PlanStep(step_id="s1", goal="one", tool_hint="t1", args={"a": 1}),
-                        PlanStep(step_id="s2", goal="two", tool_hint="t2", args={"a": 2}),
-                    ])
+        plan = Plan(
+            plan_id="p_bounded",
+            original_goal="g",
+            steps=[PlanStep(step_id="s1", goal="one", tool_hint="t1", args={"a": 1})],
+        )
         run_planner_loop_with_plan(plan=plan, execute_tool_fn=fake_execute, ask_llm_fn=fake_ask)
-        # The second step's recovery is allowed (different sig), but the FIRST
-        # planner-side recovery produced a result already recorded; confirm both
-        # were counted exactly once (no looping identical recovery calls).
-        assert len([c for c in calls if c[0] == "t2"]) == 1
+        # Initial attempt + exactly 2 bounded retries, then it must stop.
+        assert len(calls) == 3, calls
+        assert calls[0] == ("t1", {"a": 1})
+        # Every retry re-runs with the ORIGINAL args — never the model's args.
+        assert all(args == {"a": 1} for _, args in calls), calls
+        # All distinct tools (no duplicate (tool,args) re-execution).
+        assert len({(t, tuple(sorted(a.items()))) for t, a in calls}) == 3
+        # Retries exhausted -> plan is blocked, not silently completed.
+        assert plan.status == "blocked"
+        assert "NOT generated" in plan.final_answer
 
 
 class TestConfirmationSemantics:

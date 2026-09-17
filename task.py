@@ -1291,23 +1291,132 @@ def get_task_context_for_prompt(session_id: str = "default") -> str:
 # CONTINUATION SIGNALS & DETERMINISTIC RESOLUTION
 # ─────────────────────────────────────────────
 
-_CONTINUATION_PHRASES = (
+# Continuation phrases are split by ambiguity.
+#
+# STRONG phrases are unambiguous operations on the CURRENT task's work
+# ("run the searches", "retry the failed", "execute the plan"). They may be
+# matched with word boundaries anywhere in a message.
+#
+# WEAK phrases ("do it", "run it", "write the file", "resume", ...) are also
+# common in ordinary data-plane speech ("how do it work", "write the file to
+# my Desktop", "resume the video"). They count as a continuation ONLY when the
+# message is command-like — i.e. it consists almost entirely of recognized
+# control vocabulary plus politeness filler — so a bare "do it" continues the
+# task but "how do it work" / "do it yourself" / "run it in a sandbox" never do.
+_STRONG_CONTINUATION_PHRASES = (
     "continue",
+    "continue working",
+    "continue the work",
     "keep going",
     "go on",
-    "continue working",
+    "carry on",
     "don't stop",
     "do not stop",
-    "resume",
-    "next",
-    "carry on",
-    "finish it",
-    "keep working",
     "proceed",
     "move on",
-    "go ahead",
-    "finish the job",
+    "keep working",
+    "run the searches",
+    "run these searches",
+    "run those searches",
+    "execute the plan",
+    "execute the searches",
+    "do these searches",
+    "do those searches",
+    "retry the failed",
+    "retry the failed searches",
+    "retry the searches",
+    "retry the steps",
+    "retry the tool calls",
 )
+
+_WEAK_CONTINUATION_PHRASES = (
+    "resume",
+    "next",
+    "go ahead",
+    "finish it",
+    "finish the job",
+    "finish the research",
+    "do it",
+    "do the searches",
+    "do the research",
+    "do the work",
+    "run it",
+    "run them",
+    "run the steps",
+    "run the plan",
+    "run the queries",
+    "run the research",
+    "retry them",
+    "retry those",
+    "write the file",
+    "create the file",
+    "make the file",
+    "save the file",
+)
+
+# All vocabulary tokens that appear in any recognized continuation phrase —
+# used by _is_command_like() to decide whether a message is genuinely a
+# command rather than ordinary prose that merely contains a weak phrase.
+# _CONTROL_CONFIRM_TOKENS adds the confirmation-vocabulary words ("apply it",
+# "send it", "apply the change") so those phrases are also recognized as
+# command-like; "apply this filter" still fails because "filter" is not here.
+_CONTROL_CONFIRM_TOKENS = frozenset({"apply", "send", "change", "patch", "edit"})
+_CONTROL_TOKEN_SET = frozenset(
+    w
+    for _p in _STRONG_CONTINUATION_PHRASES + _WEAK_CONTINUATION_PHRASES
+    for w in _p.split()
+) | _CONTROL_CONFIRM_TOKENS
+
+# Politeness / discourse filler that may surround a control command without
+# changing its nature ("please run the searches now", "okay do it").
+_CONTROL_FILLER = frozenset({
+    "please", "pls", "now", "okay", "ok", "yes", "yeah", "yep", "yup", "sure",
+    "thanks", "thank", "ty", "again", "alright", "right", "just", "kindly",
+    "hey", "hi", "so", "well", "man", "then",
+})
+
+_CONTROL_CONNECTORS = frozenset({"and", "or", "but", ",", "&"})
+
+# Negation markers. A weak phrase inside a negated message ("don't do it") is
+# never a command — only STRONG phrases like "don't stop" survive negation.
+_CONTROL_NEGATION = frozenset({"don't", "dont", "not", "never", "can't", "cannot", "nope", "no"})
+
+
+def _phrase_re(phrase: str) -> str:
+    """Word-boundary regex for a phrase, tolerant of apostrophes/plurals."""
+    return r"\b" + re.escape(phrase) + r"\b"
+
+
+def _is_command_like(text: str) -> bool:
+    """True when ``text`` is essentially a control command.
+
+    A message is command-like when every token is either part of the control
+    vocabulary, politeness filler, or a connector — and it is not negated.
+    This is what keeps a bare "do it" (a continuation) distinct from "how do it
+    work" / "do it yourself" / "run it in a sandbox" / "don't do it" (ordinary
+    data-plane requests).
+    """
+    tokens = re.findall(r"[a-z0-9&']+", (text or "").lower())
+    if not tokens:
+        return False
+    for tok in tokens:
+        if tok in _CONTROL_NEGATION:
+            return False
+        if tok in _CONTROL_FILLER or tok in _CONTROL_CONNECTORS:
+            continue
+        if tok in _CONTROL_TOKEN_SET:
+            continue
+        return False
+    return True
+
+
+def has_continuation_signal(text: str) -> bool:
+    t = re.sub(r"\s+", " ", (text or "").lower().strip())
+    if any(re.search(_phrase_re(p), t) for p in _STRONG_CONTINUATION_PHRASES):
+        return True
+    if any(re.search(_phrase_re(p), t) for p in _WEAK_CONTINUATION_PHRASES):
+        return _is_command_like(t)
+    return False
 
 _STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "be", "to", "of", "in",
@@ -1332,11 +1441,6 @@ def _token_overlap(a: set, b: set) -> int:
     return len(a & b)
 
 
-def has_continuation_signal(text: str) -> bool:
-    t = re.sub(r"\s+", " ", (text or "").lower().strip())
-    return any(phrase in t for phrase in _CONTINUATION_PHRASES)
-
-
 def is_continuation_request(text: str) -> bool:
     """Keep the original name as a pure signal check (used by tests/tools).
 
@@ -1344,6 +1448,139 @@ def is_continuation_request(text: str) -> bool:
     resolve_task() for actual task selection.
     """
     return has_continuation_signal(text)
+
+
+# ── Control-plane command detection ─────────────────────────────────────────
+# Control commands operate on the CURRENT task's persisted work (resume the
+# plan, retry failed steps, apply a pending write). They must be distinctive
+# phrases — a broad matcher on "run"/"retry"/"write" alone would hijack normal
+# data-plane requests ("run a marathon plan", "write a poem", "retry the
+# download" as a new task). Cross-session/stale-task protection stays in
+# resolve_task(); these patterns only gate the control handler in brain.
+# The same strong/weak split as the continuation phrases applies: weak patterns
+# only count when the message is command-like (_is_command_like).
+
+# type -> (strong patterns, weak patterns)
+_CONTROL_PATTERNS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "resume_plan": (
+        (
+            r"\b(run|execute)\s+(the|these|those)\s+searches\b",
+            r"\bexecute\s+(the\s+)?plan\b",
+            r"\bdo\s+(these|those)\s+(searches|research|work)\b",
+            r"\b(keep going|carry on|continue|proceed|move on|go on|keep working|"
+            r"don't stop|do not stop|continue working)\b",
+        ),
+        (
+            r"\bresume\b",
+            r"\bnext\b",
+            r"\bgo ahead\b",
+            r"\bfinish\s+it\b",
+            r"\bfinish\s+the\s+(job|research)\b",
+            r"\bdo\s+it\b",
+            r"\b(do|run)\s+the\s+(searches|research|work)\b",
+            r"\brun\s+(it|them)\b",
+            r"\brun\s+the\s+(steps|plan|queries|research)\b",
+        ),
+    ),
+    "retry_failed": (
+        (
+            r"\bre[-]?try\s+the\s+failed\b",
+            r"\bre[-]?try\s+the\s+failed\s+searches\b",
+            r"\bre[-]?try\s+the\s+searches\b",
+            r"\bre[-]?try\s+the\s+steps\b",
+            r"\bre[-]?try\s+the\s+tool\s+calls\b",
+        ),
+        (
+            r"\bre[-]?try\s+them\b",
+            r"\bre[-]?try\s+those\b",
+        ),
+    ),
+    "apply_pending": (
+        (),
+        (
+            r"\b(write|create|make|save)\s+the\s+file\b",
+            r"\bapply\s+(it|the\s+(change|patch|edit|file|write))\b",
+            r"\byes[,\s]*(write|create|save|apply|do\s+it)\b",
+            r"\b(go ahead and|please)\s+(write|create|save|apply)\b",
+            r"\b(confirm|approved)\b",
+        ),
+    ),
+}
+
+_CONTROL_REPLACE_TOOL = [
+    r"\b(normal\s+)?web[-_ ]?search\b",
+    r"\bweb[-_ ]?search\s+tool\b",
+]
+
+
+def detect_control_command(text: str) -> list[dict]:
+    """Detect a control-plane directive for the current task.
+
+    Returns a list of {"type": ..., "replace_tool": ...} in a sensible order
+    (apply pending writes first, then resume/retry the plan). Only distinctive
+    phrases trigger; a message that is really new research/data-plane content
+    will return [] and flow through normal routing. Weak (ambiguous) phrases
+    ("do it", "write the file") only fire when the message is command-like, so
+    "how do it work" / "write the file to my Desktop" never enter the control
+    plane.
+    """
+    t = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not t:
+        return []
+    is_command = _is_command_like(t)
+    directives: list[dict] = []
+    seen: set = set()
+
+    def _push(typ, replace_tool=None):
+        key = (typ, replace_tool)
+        if key in seen:
+            return
+        seen.add(key)
+        d = {"type": typ}
+        if replace_tool:
+            d["replace_tool"] = replace_tool
+        directives.append(d)
+
+    for typ, (strong, weak) in _CONTROL_PATTERNS.items():
+        if any(re.search(p, t) for p in strong):
+            _push(typ)
+        elif is_command and any(re.search(p, t) for p in weak):
+            _push(typ)
+
+    # Optional tool replacement: "use/using normal web_search instead"
+    replace_tool = None
+    if re.search(r"(?:use|using)\s+(?:normal\s+)?web[-_ ]?search", t) or re.search(r"web[-_ ]?search\s+tool", t):
+        replace_tool = "web_search"
+    # Reorder: apply pending first, then retry, then resume.
+    order = {"apply_pending": 0, "retry_failed": 1, "resume_plan": 2}
+    directives.sort(key=lambda d: order.get(d["type"], 9))
+    if replace_tool:
+        for d in directives:
+            if d["type"] in ("retry_failed", "resume_plan"):
+                d["replace_tool"] = replace_tool
+    return directives
+
+
+def add_plan_to_task(task_id: str, plan_id: str) -> None:
+    """Record that ``plan_id`` is owned by task ``task_id`` (plan linkage).
+
+    Writes BOTH directions so the ownership is discoverable regardless of
+    which store is queried first:
+      - task registry: task.plan_ids (in-memory + persisted)
+      - plans store:   plans.active_task_id (so load_plan_for_task() finds it)
+    """
+    task = ActiveTask.load(task_id)
+    if task:
+        if plan_id and plan_id not in task.plan_ids:
+            task.plan_ids.append(plan_id)
+            task.save()
+    if plan_id:
+        try:
+            import plans
+
+            plans.set_plan_active_task(plan_id, task_id)
+        except Exception:
+            pass
 
 
 def _reference_cue(text: str) -> bool:

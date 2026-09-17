@@ -49,11 +49,11 @@ ACTIVE_SLOTS = {
         "key_env": DEFAULT_KEY_ENV,
     },
     "coding": {
-        "models": ["deepseek-ai/deepseek-v4-flash-0731", "deepseek-ai/deepseek-v4-pro-0813", "openai/gpt-oss-20b"],
+        "models": ["deepseek-ai/deepseek-v4-flash-0731", "openai/gpt-oss-20b"],
         "key_env": DEFAULT_KEY_ENV,
     },
     "frontier": {
-        "models": ["nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v4-pro-0813"],
+        "models": ["nvidia/nemotron-3-ultra-550b-a55b"],
         "key_env": DEFAULT_KEY_ENV,
     },
     "active_vision": {
