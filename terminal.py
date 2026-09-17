@@ -931,6 +931,30 @@ def main():
                 handle_input(user_input)
 
 
+def _looks_like_file_path(text: str) -> str | None:
+    """Return a resolvable single-file path if the message is just a file path.
+
+    Handles Finder-copied ``file://`` URLs, ``~/`` expansion, and absolute
+    paths pasted/typed as a single token (drag & drop on macOS inserts the
+    path as text). Multi-word messages or nonexistent paths return None.
+    """
+    import os
+
+    t = (text or "").strip()
+    if not t or len(t) > 4096:
+        return None
+    if " " in t:
+        return None
+    if t.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        t = unquote(urlparse(t).path)
+    t = os.path.expanduser(t)
+    if t.startswith("/") and os.path.exists(t) and os.path.isfile(t):
+        return t
+    return None
+
+
 def handle_local_command(text: str) -> bool:
     """Local command surface shared by the REPL and the TUI console.
 
@@ -943,6 +967,51 @@ def handle_local_command(text: str) -> bool:
         _handle_slash_slash(text.strip())
 
         return True
+
+    # ── /file <path> [path ...] — ingest one or more files into context ──
+    if text.strip().lower().startswith("/file"):
+        import brain as _brain
+
+        parts = text.split(maxsplit=1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+        paths = args.split()
+        if not paths:
+            print("  Usage: /file <path> [path ...]  — ingest files (text/PDF/image/audio/office).")
+            return True
+        for p in paths:
+            try:
+                result = _brain.ingest_file_into_context(_session_id, p)
+            except Exception as e:
+                print(f"  Could not ingest {p}: {e}")
+                continue
+            head = result.splitlines()
+            print(f"  Ingested: {p}")
+            for line in head[:4]:
+                print(f"    {line[:200]}")
+            if len(head) > 4:
+                print(f"    … ({len(result)} chars)")
+        print("  You can now ask me about the file(s).")
+        return True
+
+    # ── Bare file-path auto-detect (pasted from Finder / dragged in / typed) ──
+    _auto_path = _looks_like_file_path(text)
+    if _auto_path:
+        import brain as _brain
+
+        try:
+            result = _brain.ingest_file_into_context(_session_id, _auto_path)
+        except Exception as e:
+            print(f"  Could not ingest {_auto_path}: {e}")
+            return True
+        head = result.splitlines()
+        print(f"  Detected file: {_auto_path}")
+        for line in head[:4]:
+            print(f"    {line[:200]}")
+        if len(head) > 4:
+            print(f"    … ({len(result)} chars)")
+        print("  You can now ask me about it, e.g. 'summarize this'.")
+        return True
+
     if text.lower() in ("quit", "exit", "q"):
         speak("Goodbye.")
         wait_for_speech()

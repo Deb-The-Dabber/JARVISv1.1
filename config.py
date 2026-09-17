@@ -13,6 +13,8 @@ JARVIS_MOCK_PROVIDERS = os.getenv("JARVIS_MOCK_PROVIDERS", "0") == "1"
 JARVIS_EMBEDDING = os.getenv("JARVIS_EMBEDDING", "nemo").lower().strip()
 JARVIS_EMBED_BATCH = int(os.getenv("JARVIS_EMBED_BATCH", "64"))
 JARVIS_EMBED_MAX_CHARS = int(os.getenv("JARVIS_EMBED_MAX_CHARS", "6000"))
+JARVIS_INGEST_MAX_CHARS = int(os.getenv("JARVIS_INGEST_MAX_CHARS", "6000"))
+JARVIS_INGEST_MAX_BYTES = int(os.getenv("JARVIS_INGEST_MAX_BYTES", str(50 * 1024 * 1024)))
 
 USER_NAME = "Debasish"
 USER_CITY = "Aurora"
@@ -30,7 +32,8 @@ MIC_DEVICE_INDEX = int(os.getenv("MIC_DEVICE_INDEX", "-1"))
 WHISPER_MODEL = "base"
 
 RAG_FOLDER = os.path.expanduser(os.getenv("RAG_FOLDER", "~/Documents"))
-SUPPORTED_EXTENSIONS = {".md", ".txt", ".pdf", ".py", ".js"}
+SUPPORTED_EXTENSIONS = {".md", ".txt", ".pdf", ".py", ".js", ".png", ".jpg", ".jpeg",
+                        ".csv", ".json", ".docx", ".xlsx", ".pptx", ".mp3", ".wav", ".m4a"}
 
 MEMORY_DB_PATH = os.path.join(HOME, "jarvis_memory.db")
 VECTOR_DB_PATH = os.path.join(HOME, "jarvis_vector_db")

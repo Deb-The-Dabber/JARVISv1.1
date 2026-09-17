@@ -175,11 +175,11 @@ def ocr_document(path: str) -> str:
     ext = os.path.splitext(path)[-1].lower()
     if ext == ".pdf":
         try:
-            import PyPDF2
+            import pypdf
 
             text = []
             with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = pypdf.PdfReader(f)
                 for page in reader.pages:
                     t = page.extract_text()
                     if t:
@@ -188,20 +188,7 @@ def ocr_document(path: str) -> str:
                 return "\n".join(text)[:2000]
         except ImportError:
             pass
-        try:
-            import pdfplumber
-
-            text = []
-            with pdfplumber.open(path) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text()
-                    if t:
-                        text.append(t)
-            if text:
-                return "\n".join(text)[:2000]
-        except ImportError:
-            pass
-        return "OCR: PDF text extraction libraries not available (try: pip install PyPDF2 pdfplumber)"
+        return "OCR: PDF text extraction library not available (try: pip install pypdf)"
     if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"):
         b64 = _encode_image(path)
         return _nvidia_vision_query(b64, "Extract all visible text from this image. Return only the text.")
